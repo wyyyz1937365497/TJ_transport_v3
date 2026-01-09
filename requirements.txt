@@ -1,0 +1,33 @@
+# Ray RLlib for distributed training
+ray[rllib]==2.9.3
+ray[default]==2.9.3
+
+# PyTorch for neural networks
+torch>=1.13.0
+torchvision>=0.14.0
+torchaudio>=0.13.0
+
+# SUMO for traffic simulation
+traci>=1.0.0
+sumolib>=1.0.0
+
+# Gymnasium for RL environment
+gymnasium==0.29.1
+
+# Graph neural networks
+torch-geometric>=2.3.0
+torch-scatter>=2.1.0
+torch-sparse>=0.6.17
+
+# Data processing
+numpy>=1.21.0
+pandas>=1.5.0
+scipy>=1.9.0
+
+# Visualization
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Utilities
+tqdm>=4.64.0
+tensorboard>=2.9.0

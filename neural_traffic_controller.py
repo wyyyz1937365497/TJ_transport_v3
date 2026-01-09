@@ -46,18 +46,22 @@ class RiskSensitiveGNN(nn.Module):
             nn.Sigmoid()
         )
 
-        # 4. GNN层
+        # 4. GNN层 - 改进版（带残差连接和层归一化）
         self.gnn_layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList()
+        
         for i in range(num_layers):
             self.gnn_layers.append(
                 GATConv(
-                    in_channels=hidden_dim if i > 0 else hidden_dim,
+                    in_channels=hidden_dim,
                     out_channels=hidden_dim,
                     heads=heads,
                     concat=False,
-                    edge_dim=hidden_dim // 2
+                    edge_dim=hidden_dim // 2,
+                    dropout=0.1
                 )
             )
+            self.norm_layers.append(nn.LayerNorm(hidden_dim))
 
         # 5. 输出投影层
         self.output_layer = nn.Sequential(
@@ -101,11 +105,13 @@ class RiskSensitiveGNN(nn.Module):
         else:
             risk_weights = None
 
-        # 3. GNN传播
+        # 3. GNN传播 - 改进版（残差连接）
         x = node_features
-        for layer in self.gnn_layers:
+        for i, (layer, norm) in enumerate(zip(self.gnn_layers, self.norm_layers)):
+            residual = x
             x = layer(x, graph.edge_index, edge_attr=edge_features)
             x = F.relu(x)
+            x = norm(x + residual)  # 残差连接 + 层归一化
 
         # 4. 输出投影
         global_embedding = self.output_layer(x)  # [N, 256]

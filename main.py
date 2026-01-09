@@ -81,7 +81,7 @@ class SUMOCompetitionFramework:
             'cost_limit': 0.1,
             'lambda_lr': 0.01,
             'cache_timeout': 10,
-            'device': 'cpu',  # 使用CPU以确保兼容性
+            'device': 'cuda',  # 使用CPU以确保兼容性
             'model_path': None  # 预训练模型路径
         }
 
@@ -293,24 +293,95 @@ class SUMOCompetitionFramework:
                 # 确定是否为ICV (25%概率)
                 is_icv = hash(veh_id) % 100 < 25
 
-                # 获取车辆位置（简化）
+                # 获取车辆位置
                 try:
                     position = traci.vehicle.getLanePosition(veh_id)
                 except:
                     position = 0.0
 
+                # 获取速度
+                try:
+                    speed = traci.vehicle.getSpeed(veh_id)
+                except:
+                    speed = 0.0
+
+                # 获取加速度
+                try:
+                    acceleration = traci.vehicle.getAcceleration(veh_id)
+                except:
+                    acceleration = 0.0
+
+                # 获取车道索引
+                try:
+                    lane_index = traci.vehicle.getLaneIndex(veh_id)
+                except:
+                    lane_index = 0
+
+                # 获取车道ID
+                try:
+                    lane_id = traci.vehicle.getLaneID(veh_id)
+                except:
+                    lane_id = ""
+
+                # 获取路线信息
+                try:
+                    route = traci.vehicle.getRoute(veh_id)
+                    route_index = traci.vehicle.getRouteIndex(veh_id)
+                except:
+                    route = []
+                    route_index = 0
+
+                # 计算剩余距离（基于路线）
+                remaining_distance = 0.0
+                if route and route_index < len(route):
+                    try:
+                        # 获取当前路段长度
+                        current_edge_length = traci.lane.getLength(f"{lane_id}_0") if lane_id else 0
+                        remaining_distance += current_edge_length - position
+                        
+                        # 计算剩余路段的长度
+                        for i in range(route_index + 1, len(route)):
+                            edge_id = route[i]
+                            try:
+                                edge_length = traci.edge.getLength(edge_id)
+                                remaining_distance += edge_length
+                            except:
+                                remaining_distance += 100  # 默认长度
+                    except:
+                        remaining_distance = 1000.0  # 默认值
+
+                # 计算完成率
+                try:
+                    total_route_length = sum(
+                        traci.edge.getLength(edge_id) for edge_id in route
+                        if traci.edge.getLength(edge_id) > 0
+                    ) if route else 1.0
+                    completed_distance = max(0.0, total_route_length - remaining_distance)
+                    completion_rate = min(1.0, completed_distance / max(total_route_length, 1.0))
+                except:
+                    completion_rate = 0.0
+
+                # 获取当前边缘ID
+                try:
+                    edge_id = traci.vehicle.getRoadID(veh_id)
+                except:
+                    edge_id = ""
+
                 vehicle_data[veh_id] = {
                     'position': position,
-                    'speed': traci.vehicle.getSpeed(veh_id),
-                    'acceleration': traci.vehicle.getAcceleration(veh_id),
-                    'lane_index': traci.vehicle.getLaneIndex(veh_id),
-                    'remaining_distance': 1000.0,  # 简化
-                    'completion_rate': 0.5,  # 简化
+                    'speed': speed,
+                    'acceleration': acceleration,
+                    'lane_index': lane_index,
+                    'remaining_distance': remaining_distance,
+                    'completion_rate': completion_rate,
                     'is_icv': is_icv,
                     'id': veh_id,
-                    'lane_id': traci.vehicle.getLaneID(veh_id)
+                    'lane_id': lane_id,
+                    'edge_id': edge_id,
+                    'route_index': route_index
                 }
             except Exception as e:
+                print(f"Error collecting data for vehicle {veh_id}: {e}")
                 continue
 
         return vehicle_data

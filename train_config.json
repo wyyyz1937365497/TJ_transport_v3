@@ -3,8 +3,8 @@
         "phase1_epochs": 50,
         "phase2_epochs": 200,
         "phase3_epochs": 100,
-        "batch_size": 64,
-        "learning_rate": 0.0003,
+        "batch_size": 512,
+        "learning_rate": 0.00003,
         "weight_decay": 0.0001,
         "save_path": "models/traffic_controller_v1.pth"
     },
@@ -29,6 +29,6 @@
         "cost_limit": 0.1,
         "lambda_lr": 0.01,
         "cache_timeout": 10,
-        "device": "cpu"
+        "device": "cuda"
     }
 }

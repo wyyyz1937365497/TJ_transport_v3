@@ -802,16 +802,26 @@ class NeuralTrafficController:
             vehicle = vehicle_data[veh_id]
 
             # 节点特征: [位置, 速度, 加速度, 车道, 剩余距离, 完成率, 类型, 时间, 步长]
+            position = vehicle.get('position', 0.0)
+            speed = vehicle.get('speed', 0.0)
+            acceleration = vehicle.get('acceleration', 0.0)
+            lane_index = vehicle.get('lane_index', 0)
+            remaining_distance = vehicle.get('remaining_distance', 1000.0)
+            completion_rate = vehicle.get('completion_rate', 0.0)
+            is_icv = 1.0 if vehicle.get('is_icv', False) else 0.0  # ICV标志
+            current_time = step * 0.1  # 时间(秒)
+            time_step = 0.1  # 步长
+
             features = [
-                vehicle.get('position', 0.0),
-                vehicle.get('speed', 0.0),
-                vehicle.get('acceleration', 0.0),
-                vehicle.get('lane_index', 0),
-                vehicle.get('remaining_distance', 1000.0),
-                vehicle.get('completion_rate', 0.0),
-                1.0 if vehicle.get('is_icv', False) else 0.0,  # ICV标志
-                step * 0.1,  # 时间(秒)
-                0.1  # 步长
+                position,
+                speed,
+                acceleration,
+                lane_index,
+                remaining_distance,
+                completion_rate,
+                is_icv,
+                current_time,
+                time_step
             ]
 
             node_features.append(features)
@@ -821,31 +831,57 @@ class NeuralTrafficController:
         edge_indices = []
         edge_features = []
 
-        # 简化版：连接相近车辆
+        # 连接相近车辆，考虑实际的车辆位置和车道
         for i, veh_id_i in enumerate(vehicle_ids):
             for j, veh_id_j in enumerate(vehicle_ids):
                 if i == j:
                     continue
 
-                # 计算距离
-                pos_i = vehicle_data[veh_id_i].get('position', 0.0)
-                pos_j = vehicle_data[veh_id_j].get('position', 0.0)
-                speed_i = vehicle_data[veh_id_i].get('speed', 0.0)
-                speed_j = vehicle_data[veh_id_j].get('speed', 0.0)
+                # 获取车辆信息
+                vehicle_i = vehicle_data[veh_id_i]
+                vehicle_j = vehicle_data[veh_id_j]
+                
+                # 获取车辆位置和速度
+                pos_i = vehicle_i.get('position', 0.0)
+                pos_j = vehicle_j.get('position', 0.0)
+                speed_i = vehicle_i.get('speed', 0.0)
+                speed_j = vehicle_j.get('speed', 0.0)
+                
+                # 获取车道信息
+                lane_i = vehicle_i.get('lane_id', '')
+                lane_j = vehicle_j.get('lane_id', '')
 
+                # 计算距离
                 distance = abs(pos_i - pos_j)
-                if distance < 50:  # 50米内
+                
+                # 只有在同一条车道上或距离很近的情况下才建立连接
+                if lane_i == lane_j or distance < 50:  # 50米内或同车道
                     edge_indices.append([i, j])
 
                     # 边特征: [相对距离, 相对速度, TTC, THW]
                     rel_distance = distance
                     rel_speed = abs(speed_i - speed_j)
 
-                    # 估算TTC和THW
-                    ttc = rel_distance / max(rel_speed, 0.1) if rel_speed > 0 else 100
-                    thw = rel_distance / max(speed_i, 0.1) if speed_i > 0 else 100
+                    # 计算TTC (Time To Collision) 和 THW (Time Headway)
+                    # TTC = distance / closing_speed (如果接近的话)
+                    closing_speed = abs(speed_i - speed_j)
+                    if speed_i > speed_j and closing_speed > 0.1:
+                        # 车辆i在追车辆j的情况
+                        ttc = rel_distance / closing_speed if closing_speed > 0 else float('inf')
+                    else:
+                        # 不会追尾
+                        ttc = float('inf')
 
-                    edge_features.append([rel_distance, rel_speed, min(ttc, 10), min(thw, 10)])
+                    # THW = distance / speed_of_rear_vehicle (对于后车而言)
+                    rear_speed = min(speed_i, speed_j)
+                    thw = rel_distance / rear_speed if rear_speed > 0 else float('inf')
+
+                    edge_features.append([
+                        rel_distance,
+                        rel_speed,
+                        min(ttc, 100.0),  # 限制TTC最大值
+                        min(thw, 100.0)   # 限制THW最大值
+                    ])
 
         # 3. 全局交通指标
         global_metrics = self._calculate_global_metrics(vehicle_data, step)

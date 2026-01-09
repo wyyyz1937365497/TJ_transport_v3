@@ -136,24 +136,95 @@ class SumoEnvironmentAdapter(gym.Env):
                 # 确定是否为ICV (25%概率)
                 is_icv = hash(veh_id) % 100 < 25
 
-                # 获取车辆位置（简化）
+                # 获取车辆位置
                 try:
                     position = traci.vehicle.getLanePosition(veh_id)
                 except:
                     position = 0.0
 
+                # 获取速度
+                try:
+                    speed = traci.vehicle.getSpeed(veh_id)
+                except:
+                    speed = 0.0
+
+                # 获取加速度
+                try:
+                    acceleration = traci.vehicle.getAcceleration(veh_id)
+                except:
+                    acceleration = 0.0
+
+                # 获取车道索引
+                try:
+                    lane_index = traci.vehicle.getLaneIndex(veh_id)
+                except:
+                    lane_index = 0
+
+                # 获取车道ID
+                try:
+                    lane_id = traci.vehicle.getLaneID(veh_id)
+                except:
+                    lane_id = ""
+
+                # 获取路线信息
+                try:
+                    route = traci.vehicle.getRoute(veh_id)
+                    route_index = traci.vehicle.getRouteIndex(veh_id)
+                except:
+                    route = []
+                    route_index = 0
+
+                # 计算剩余距离（基于路线）
+                remaining_distance = 0.0
+                if route and route_index < len(route):
+                    try:
+                        # 获取当前路段长度
+                        current_edge_length = traci.lane.getLength(f"{lane_id}_0") if lane_id else 0
+                        remaining_distance += current_edge_length - position
+                        
+                        # 计算剩余路段的长度
+                        for i in range(route_index + 1, len(route)):
+                            edge_id = route[i]
+                            try:
+                                edge_length = traci.edge.getLength(edge_id)
+                                remaining_distance += edge_length
+                            except:
+                                remaining_distance += 100  # 默认长度
+                    except:
+                        remaining_distance = 1000.0  # 默认值
+
+                # 计算完成率
+                try:
+                    total_route_length = sum(
+                        traci.edge.getLength(edge_id) for edge_id in route
+                        if traci.edge.getLength(edge_id) > 0
+                    ) if route else 1.0
+                    completed_distance = max(0.0, total_route_length - remaining_distance)
+                    completion_rate = min(1.0, completed_distance / max(total_route_length, 1.0))
+                except:
+                    completion_rate = 0.0
+
+                # 获取当前边缘ID
+                try:
+                    edge_id = traci.vehicle.getRoadID(veh_id)
+                except:
+                    edge_id = ""
+
                 vehicle_data[veh_id] = {
                     'position': position,
-                    'speed': traci.vehicle.getSpeed(veh_id),
-                    'acceleration': traci.vehicle.getAcceleration(veh_id),
-                    'lane_index': traci.vehicle.getLaneIndex(veh_id),
-                    'remaining_distance': 1000.0,  # 简化
-                    'completion_rate': 0.5,  # 简化
+                    'speed': speed,
+                    'acceleration': acceleration,
+                    'lane_index': lane_index,
+                    'remaining_distance': remaining_distance,
+                    'completion_rate': completion_rate,
                     'is_icv': is_icv,
                     'id': veh_id,
-                    'lane_id': traci.vehicle.getLaneID(veh_id)
+                    'lane_id': lane_id,
+                    'edge_id': edge_id,
+                    'route_index': route_index
                 }
             except Exception as e:
+                print(f"Error collecting data for vehicle {veh_id}: {e}")
                 continue
 
         return vehicle_data
@@ -168,8 +239,9 @@ class SumoEnvironmentAdapter(gym.Env):
         edge_indices = np.zeros((2, 200), dtype=np.int64)
         global_metrics = np.zeros(16, dtype=np.float32)
         
-        # 填充节点特征
-        for i, veh_id in enumerate(vehicle_ids[:100]):  # 最多取100辆车
+        # 收集完整的车辆数据
+        vehicle_data_list = []
+        for veh_id in vehicle_ids[:100]:  # 最多取100辆车
             try:
                 # 获取车辆信息
                 position = traci.vehicle.getLanePosition(veh_id)
@@ -177,34 +249,89 @@ class SumoEnvironmentAdapter(gym.Env):
                 acceleration = traci.vehicle.getAcceleration(veh_id)
                 lane_index = traci.vehicle.getLaneIndex(veh_id)
                 
+                # 获取路线和距离信息
+                route = traci.vehicle.getRoute(veh_id)
+                route_index = traci.vehicle.getRouteIndex(veh_id)
+                
+                # 计算剩余距离
+                remaining_distance = 0.0
+                if route and route_index < len(route):
+                    try:
+                        # 获取当前路段长度
+                        lane_id = traci.vehicle.getLaneID(veh_id)
+                        current_edge_length = traci.lane.getLength(f"{lane_id}_0") if lane_id else 0
+                        remaining_distance += current_edge_length - position
+                        
+                        # 计算剩余路段的长度
+                        for i in range(route_index + 1, len(route)):
+                            edge_id = route[i]
+                            try:
+                                edge_length = traci.edge.getLength(edge_id)
+                                remaining_distance += edge_length
+                            except:
+                                remaining_distance += 100  # 默认长度
+                    except:
+                        remaining_distance = 1000.0  # 默认值
+
+                # 计算完成率
+                try:
+                    total_route_length = sum(
+                        traci.edge.getLength(edge_id) for edge_id in route
+                        if traci.edge.getLength(edge_id) > 0
+                    ) if route else 1.0
+                    completed_distance = max(0.0, total_route_length - remaining_distance)
+                    completion_rate = min(1.0, completed_distance / max(total_route_length, 1.0))
+                except:
+                    completion_rate = 0.0
+                
                 # 节点特征: [位置, 速度, 加速度, 车道, 剩余距离, 完成率, 类型, 时间, 步长]
                 is_icv = 1.0 if (hash(veh_id) % 100 < 25) else 0.0  # 25%是智能车
                 
-                node_features[i] = [
+                node_features[len(vehicle_data_list)] = [
                     position,
                     speed,
                     acceleration,
                     lane_index,
-                    1000.0,  # 剩余距离（简化）
-                    0.5,     # 完成率（简化）
+                    remaining_distance,
+                    completion_rate,
                     is_icv,
                     self.current_step * 0.1,  # 时间
                     0.1       # 步长
                 ]
-            except:
+                
+                vehicle_data_list.append({
+                    'id': veh_id,
+                    'position': position,
+                    'speed': speed,
+                    'lane_id': traci.vehicle.getLaneID(veh_id)
+                })
+            except Exception as e:
+                print(f"Error getting data for vehicle {veh_id}: {e}")
                 continue
         
-        # 构建边索引（简单连接相邻车辆）
+        # 构建边索引（基于车辆间的距离）
         edge_idx = 0
-        for i in range(len(vehicle_ids[:100])):
-            for j in range(i+1, min(i+6, len(vehicle_ids[:100]))):  # 每辆车连接最近的5辆车
-                if edge_idx < 200:
-                    edge_indices[0][edge_idx] = i
-                    edge_indices[1][edge_idx] = j
-                    edge_idx += 1
+        for i in range(len(vehicle_data_list)):
+            for j in range(i+1, len(vehicle_data_list)):
+                # 计算车辆之间的距离（基于车道和位置）
+                veh_i = vehicle_data_list[i]
+                veh_j = vehicle_data_list[j]
+                
+                # 如果在同一条车道上，计算相对距离
+                if veh_i['lane_id'] == veh_j['lane_id']:
+                    distance = abs(veh_i['position'] - veh_j['position'])
+                    if distance < 50:  # 距离小于50米则建立连接
+                        if edge_idx < 200:
+                            edge_indices[0][edge_idx] = i
+                            edge_indices[1][edge_idx] = j
+                            edge_idx += 1
+                # 如果不在同一条车道但距离可能较近，可以进一步判断
+                # （这里为了简化只考虑同一车道的情况，可以根据需要扩展）
         
         # 计算全局指标
-        speeds = [traci.vehicle.getSpeed(vid) for vid in vehicle_ids if vid in vehicle_ids]
+        speeds = [data['speed'] for data in vehicle_data_list]
+        positions = [data['position'] for data in vehicle_data_list]
+        
         if speeds:
             avg_speed = np.mean(speeds)
             speed_std = np.std(speeds)
@@ -212,17 +339,51 @@ class SumoEnvironmentAdapter(gym.Env):
             avg_speed = 0.0
             speed_std = 0.0
             
+        if positions:
+            avg_position = np.mean(positions)
+            min_position = min(positions) if positions else 0.0
+            max_position = max(positions) if positions else 0.0
+        else:
+            avg_position = 0.0
+            min_position = 0.0
+            max_position = 0.0
+            
+        # 计算加速度相关指标
+        accelerations = []
+        for veh_id in vehicle_ids:
+            try:
+                acc = traci.vehicle.getAcceleration(veh_id)
+                accelerations.append(acc)
+            except:
+                continue
+        
+        avg_accel = np.mean(accelerations) if accelerations else 0.0
+        abs_avg_accel = np.mean(np.abs(accelerations)) if accelerations else 0.0
+        
+        # 统计ICV和普通车辆
+        icv_count = sum(1 for vid in vehicle_ids if hash(vid) % 100 < 25)
+        regular_count = len(vehicle_ids) - icv_count
+        
+        # ICV和普通车辆的速度总和
+        icv_speed_sum = sum(traci.vehicle.getSpeed(vid) for vid in vehicle_ids if hash(vid) % 100 < 25)
+        regular_speed_sum = sum(traci.vehicle.getSpeed(vid) for vid in vehicle_ids if hash(vid) % 100 >= 25)
+        
         global_metrics = np.array([
-            avg_speed, speed_std, 0.0, len(vehicle_ids),  # 前4个：平均速度，速度标准差，平均加速度，车辆数
+            avg_speed,           # 平均速度
+            speed_std,           # 速度标准差
+            abs_avg_accel,       # 平均绝对加速度
+            len(vehicle_ids),    # 车辆总数
             self.current_step * 0.1,  # 当前时间
-            0.0, 0.0, 0.0,  # 位置相关（简化）
-            sum(1 for vid in vehicle_ids if hash(vid) % 100 < 25),  # ICV数量
-            len(vehicle_ids) - sum(1 for vid in vehicle_ids if hash(vid) % 100 < 25),  # 非ICV数量
-            sum(traci.vehicle.getSpeed(vid) for vid in vehicle_ids if hash(vid) % 100 < 25),  # ICV总速度
-            sum(traci.vehicle.getSpeed(vid) for vid in vehicle_ids if hash(vid) % 100 >= 25),  # 非ICV总速度
+            min_position,        # 最小位置
+            max_position,        # 最大位置
+            avg_position,        # 平均位置
+            icv_count,           # ICV数量
+            regular_count,       # 非ICV数量
+            icv_speed_sum,       # ICV总速度
+            regular_speed_sum,   # 非ICV总速度
             avg_speed * len(vehicle_ids),  # 总流量
             speed_std * len(vehicle_ids),  # 总波动
-            0.0,  # 总加速度（简化）
+            abs_avg_accel * len(vehicle_ids),  # 总加速度变化
             self.current_step % 100  # 周期性特征
         ], dtype=np.float32)
         

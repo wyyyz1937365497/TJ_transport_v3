@@ -73,7 +73,7 @@ def train_with_sumo_rl():
             entropy_coeff=0.05
         )
         .framework(framework="torch")
-        .resources(num_gpus=0)  # 使用CPU进行训练
+        .resources(num_gpus=2)  # 使用CPU进行训练
     )
     
     # 创建算法实例

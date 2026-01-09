@@ -34,7 +34,7 @@ def train_with_ray():
     
     # 创建模型配置
     model_config = config["model"].copy()
-    model_config["device"] = "cpu"  # 在并行环境中使用CPU
+    model_config["device"] = "cuda"  # 在并行环境中使用CPU
     
     # 配置算法
     algo_config = (

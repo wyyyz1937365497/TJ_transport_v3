@@ -104,7 +104,7 @@ class RiskSensitiveGNN(nn.Module):
         # 3. GNN传播
         x = node_features
         for layer in self.gnn_layers:
-            x = layer(x, graph.edge_index, edge_attr=edge_features, attention_weights=risk_weights)
+            x = layer(x, graph.edge_index, edge_attr=edge_features)
             x = F.relu(x)
 
         # 4. 输出投影
@@ -173,9 +173,9 @@ class ProgressiveWorldModel(nn.Module):
         """权重初始化"""
         for m in self.modules():
             if isinstance(m, (nn.Linear, nn.LSTM)):
-                if hasattr(m, 'weight') and m.weight is not None:
+                if hasattr(m, 'weight') and m.weight is not None and isinstance(m.weight, torch.Tensor):
                     nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if hasattr(m, 'bias') and m.bias is not None:
+                if hasattr(m, 'bias') and m.bias is not None and isinstance(m.bias, torch.Tensor):
                     nn.init.constant_(m.bias, 0)
 
     def set_phase(self, phase: int):
@@ -253,7 +253,7 @@ class InfluenceDrivenController(nn.Module):
 
         # 2. 特征融合层
         self.fusion_layer = nn.Sequential(
-            nn.Linear(gnn_dim + 64 + world_dim, 384),
+            nn.Linear(gnn_dim + 64 + 257, 384),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(384, hidden_dim),
@@ -365,7 +365,7 @@ class InfluenceDrivenController(nn.Module):
         k = min(self.top_k, len(icv_indices))
         top_k_scores, top_k_indices = torch.topk(influence_scores, k, largest=True, sorted=True)
 
-        selected_indices = icv_indices[top_k_indices]  # [K]
+        selected_indices = icv_indices[top_k_indices.cpu()]  # [K]
         selected_vehicle_ids = [vehicle_ids[i] for i in selected_indices.cpu().numpy()]
 
         # 5. 为选中车辆生成动作
@@ -512,7 +512,7 @@ class DualModeSafetyShield(nn.Module):
                 continue
 
             ego_vehicle = vehicle_states['data'][veh_id]
-            leader_vehicle = self._find_leader(ego_vehicle, vehicle_states['data'])
+            leader_vehicle = self._find_leader(veh_id, ego_vehicle, vehicle_states['data'])
 
             if leader_vehicle:
                 # 计算TTC和THW
@@ -528,13 +528,13 @@ class DualModeSafetyShield(nn.Module):
 
         return final_actions, emergency_mask
 
-    def _find_leader(self, ego: Dict[str, Any], all_vehicles: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _find_leader(self, ego_id: str, ego: Dict[str, Any], all_vehicles: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """找到前车"""
         min_distance = float('inf')
         leader = None
 
         for veh_id, vehicle in all_vehicles.items():
-            if veh_id == ego['id']:
+            if veh_id == ego_id:
                 continue
 
             # 检查是否在同一车道

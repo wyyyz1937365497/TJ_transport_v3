@@ -9,7 +9,10 @@ TJ_transport_v3/
 ├── neural_traffic_controller.py      # 主要的神经网络控制器实现
 ├── main.py                          # 改进的主程序，集成神经控制器
 ├── sumo_env_adapter.py              # SUMO环境适配器
-├── train.py                         # 训练脚本
+├── train.py                         # 传统训练脚本
+├── ray_train.py                     # Ray RLlib分布式训练脚本
+├── sumo_rl_train.py                 # SUMO-RL多实例训练脚本
+├── run_ray_training.py              # Ray训练启动脚本
 ├── train_config.json                # 训练配置文件
 ├── 仿真环境-初赛/                     # 原始仿真环境
 │   ├── main.py
@@ -56,13 +59,41 @@ python main.py
 python main.py 仿真环境-初赛/sumo.sumocfg
 ```
 
-### 2. 训练模型
+### 2. 传统训练方式
 
 ```bash
 python train.py
 ```
 
-### 3. 配置参数
+### 3. Ray RLlib分布式并行训练
+
+首先安装Ray RLlib：
+
+```bash
+pip install ray[rllib]
+```
+
+然后运行并行训练：
+
+```bash
+python run_ray_training.py
+```
+
+或者指定配置文件：
+
+```bash
+python run_ray_training.py --config train_config.json --sumo-config 仿真环境-初赛/sumo.sumocfg
+```
+
+### 4. SUMO-RL多实例训练（推荐）
+
+使用SUMO-RL实现多SUMO实例并行训练：
+
+```bash
+python sumo_rl_train.py
+```
+
+### 5. 配置参数
 
 可以在[train_config.json](train_config.json)中修改训练参数：
 
@@ -73,6 +104,9 @@ python train.py
 - `learning_rate`: 学习率
 - `top_k`: 同时控制的车辆数
 - `device`: 计算设备（cpu或cuda）
+- `parallel.num_workers`: 并行工作进程数
+- `parallel.base_port`: SUMO实例基础端口
+- `parallel.env_per_worker`: 每个工作进程的环境数
 
 ## 系统要求
 
@@ -83,6 +117,7 @@ python train.py
 - Gymnasium
 - Pandas
 - NumPy
+- Ray RLlib (用于并行训练)
 
 ## 技术细节
 
@@ -106,6 +141,25 @@ python train.py
 - Level 1: 动作裁剪和限幅
 - Level 2: 紧急制动干预
 
+## 并行训练架构
+
+### Ray RLlib集成
+- 支持多进程并行训练
+- 每个进程可运行多个SUMO实例
+- 动态端口分配避免冲突
+- 高效的数据吞吐和模型更新
+
+### SUMO-RL多实例训练
+- 基于SUMO-RL框架实现多实例并行训练
+- 通过不同端口运行多个SUMO实例
+- 更高效地生成训练数据
+- 显著加快训练速度
+
+### 分布式训练优势
+- 提高训练数据吞吐量
+- 快速迭代实验
+- 支持更大规模的仿真场景
+
 ## 评估指标
 
 系统优化目标为最大化总评分：
@@ -122,3 +176,4 @@ S_total = S_perf × P_int
 2. 不修改原始OD路径，仅对车辆速度进行控制
 3. 所有安全约束均得到满足
 4. 模型设计考虑了实时性要求
+5. 并行训练可显著加快模型收敛速度

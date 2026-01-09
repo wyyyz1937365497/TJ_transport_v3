@@ -13,13 +13,14 @@ class SumoEnvironmentAdapter(gym.Env):
     SUMO环境适配器，用于与神经网络控制器配合
     """
     
-    def __init__(self, sumo_cfg_path: str, max_steps: int = 3600, step_interval: int = 5):
+    def __init__(self, sumo_cfg_path: str, max_steps: int = 3600, step_interval: int = 5, port=None):
         super(SumoEnvironmentAdapter, self).__init__()
         
         self.sumo_cfg_path = sumo_cfg_path
         self.max_steps = max_steps
         self.step_interval = step_interval  # 每隔几个仿真步执行一次控制
         self.current_step = 0
+        self.port = port
         
         # 初始化SUMO
         self._initialize_sumo()
@@ -58,8 +59,13 @@ class SumoEnvironmentAdapter(gym.Env):
         """初始化SUMO仿真环境"""
         sumo_binary = "sumo"
         sumo_cmd = [sumo_binary, "-c", self.sumo_cfg_path, "--no-warnings", "true"]
+        
+        # 如果指定了端口，则添加远程端口参数
+        if self.port is not None:
+            sumo_cmd.extend(["--remote-port", str(self.port)])
+        
         traci.start(sumo_cmd)
-        print("✅ SUMO仿真环境启动成功!")
+        print(f"✅ SUMO仿真环境启动成功! 端口: {self.port if self.port else 'default'}")
 
     def reset(self, seed=None, options=None):
         """重置环境"""

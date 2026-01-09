@@ -336,8 +336,18 @@ class InfluenceDrivenController(nn.Module):
         global_features = self.global_encoder(global_metrics)  # [B, 64]
 
         # 2. 融合特征
-        # 取世界模型的平均预测
-        avg_world_pred = world_predictions.mean(dim=1) if world_predictions.dim() == 3 else world_predictions
+        # 处理world_predictions的不同维度
+        if world_predictions.dim() == 3:
+            # Phase 2: [N, 5, 257] -> 取平均得到 [N, 257]
+            avg_world_pred = world_predictions.mean(dim=1)
+        elif world_predictions.dim() == 2:
+            # Phase 1: [N, 256] -> 需要padding到257维
+            avg_world_pred = torch.cat([
+                world_predictions,
+                torch.zeros(batch_size, 1, device=world_predictions.device)
+            ], dim=1)
+        else:
+            avg_world_pred = world_predictions
 
         # 重复全局特征以匹配批次大小
         global_features_expanded = global_features.repeat(batch_size, 1)
@@ -347,7 +357,7 @@ class InfluenceDrivenController(nn.Module):
             gnn_embedding,
             global_features_expanded,
             avg_world_pred
-        ], dim=1)  # [N, 256+64+256] = [N, 576]
+        ], dim=1)  # [N, 256+64+257] = [N, 577]
 
         fused_features = self.fusion_layer(fused_input)  # [N, 128]
 

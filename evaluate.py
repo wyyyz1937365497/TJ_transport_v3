@@ -112,42 +112,104 @@ class Evaluator:
         return total_reward
     
     def _generate_vehicle_data(self, step: int) -> Dict[str, Any]:
-        """生成模拟车辆数据"""
+        """
+        生成模拟车辆数据
+        注意：在实际评估中，应该使用真实的SUMO环境数据
+        此方法仅用于演示，生产环境应从SUMO获取真实数据
+        """
+        import warnings
+        warnings.warn(
+            "使用模拟数据进行评估。在实际生产环境中，"
+            "应该使用真实的SUMO仿真数据。",
+            RuntimeWarning
+        )
+        
         vehicle_data = {}
         
-        # 动态生成车辆数量
+        # 基于物理规律生成更真实的车辆数据
         num_vehicles = int(10 + 10 * np.sin(step * 0.01))
         
         for i in range(num_vehicles):
             veh_id = f"veh_{step}_{i}"
+            
+            # 基于车道和位置生成更合理的数据
+            lane_index = np.random.randint(0, 3)
+            position = np.random.uniform(0, 1000) + lane_index * 50  # 不同车道偏移
+            
+            # 速度基于位置（接近终点可能减速）
+            base_speed = 15.0
+            speed = base_speed + np.random.normal(0, 3.0)
+            speed = max(5.0, min(30.0, speed))  # 限制在合理范围
+            
+            # 加速度基于速度变化
+            acceleration = np.random.normal(0, 0.5)
+            acceleration = max(-3.0, min(2.0, acceleration))
+            
+            # 剩余距离和完成率
+            remaining_distance = max(0.0, 1000.0 - position)
+            completion_rate = position / 1000.0
+            
             vehicle_data[veh_id] = {
-                'position': np.random.uniform(0, 1000),
-                'speed': np.random.uniform(5, 25),
-                'acceleration': np.random.uniform(-2, 2),
-                'lane_index': np.random.randint(0, 3),
-                'remaining_distance': np.random.uniform(100, 1000),
-                'completion_rate': np.random.uniform(0, 1),
+                'position': position,
+                'speed': speed,
+                'acceleration': acceleration,
+                'lane_index': lane_index,
+                'remaining_distance': remaining_distance,
+                'completion_rate': completion_rate,
                 'is_icv': np.random.random() < 0.25,  # 25% ICV
                 'id': veh_id,
-                'lane_id': f"lane_{np.random.randint(0, 3)}"
+                'lane_id': f"lane_{lane_index}"
             }
         
         return vehicle_data
     
-    def _calculate_reward(self, vehicle_data: Dict[str, Any], 
+    def _calculate_reward(self, vehicle_data: Dict[str, Any],
                         control_results: Dict[str, Any]) -> float:
-        """计算奖励"""
-        # 速度奖励
+        """
+        计算奖励 - 基于真实交通指标
+        考虑：流量效率、安全、稳定性、控制成本
+        """
+        if not vehicle_data:
+            return 0.0
+        
         speeds = [v['speed'] for v in vehicle_data.values()]
+        accelerations = [v.get('acceleration', 0.0) for v in vehicle_data.values()]
+        
+        # 1. 流量效率奖励
         avg_speed = np.mean(speeds) if speeds else 0.0
+        flow_efficiency = avg_speed / 30.0  # 归一化到[0,1]
+        
+        # 2. 稳定性惩罚
         speed_std = np.std(speeds) if len(speeds) > 1 else 0.0
+        accel_std = np.std(accelerations) if len(accelerations) > 1 else 0.0
+        stability_penalty = (speed_std / 10.0 + accel_std / 5.0) * 0.5
         
-        # 干预成本
-        intervention_cost = control_results['safety_interventions'] * 0.1
-        emergency_cost = control_results['emergency_interventions'] * 1.0
+        # 3. 安全评估
+        safety_penalty = 0.0
+        for vehicle in vehicle_data.values():
+            speed = vehicle.get('speed', 0.0)
+            accel = vehicle.get('acceleration', 0.0)
+            
+            # 检查危险驾驶行为
+            if speed > 35.0:  # 超速
+                safety_penalty += (speed - 35.0) * 0.1
+            if accel < -4.0:  # 急刹车
+                safety_penalty += (-accel - 4.0) * 0.2
+            if accel > 3.0:  # 急加速
+                safety_penalty += (accel - 3.0) * 0.1
         
-        # 奖励 = 速度奖励 - 不稳定惩罚 - 干预成本 - 紧急成本
-        reward = avg_speed * 0.1 - speed_std * 0.5 - intervention_cost - emergency_cost
+        # 4. 控制成本
+        intervention_cost = control_results.get('safety_interventions', 0) * 0.05
+        emergency_cost = control_results.get('emergency_interventions', 0) * 0.5
+        
+        # 5. 综合奖励
+        reward = (
+            flow_efficiency * 10.0           # 流量效率权重
+            - stability_penalty * 2.0         # 稳定性惩罚权重
+            - safety_penalty * 5.0            # 安全惩罚权重
+            - intervention_cost                # 控制成本
+            - emergency_cost                   # 紧急干预成本
+        )
         
         return reward
     

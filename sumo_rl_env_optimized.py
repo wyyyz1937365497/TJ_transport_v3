@@ -407,6 +407,7 @@ class SUMORLEnvironmentOptimized:
     def _get_observation(self) -> Dict[str, Any]:
         """
         获取当前观测（使用 TraCI 订阅优化）
+        使用配置的ICV车辆列表而非随机哈希
         
         Returns:
             observation: 观测数据
@@ -427,14 +428,15 @@ class SUMORLEnvironmentOptimized:
             
             # 批量获取车辆数据
             vehicle_data = self.subscription_manager.batch_get_vehicle_data(self.vehicle_ids)
+            
+            # 为每辆车添加ICV标记
+            for veh_id in vehicle_data:
+                vehicle_data[veh_id]['is_icv'] = self._is_icv_vehicle(veh_id)
         else:
             # 降级方案：直接获取
             vehicle_data = {}
             for veh_id in self.vehicle_ids:
                 try:
-                    # 确定是否为 ICV (25% 概率)
-                    is_icv = hash(veh_id) % 100 < 25
-                    
                     vehicle_data[veh_id] = {
                         'position': traci.vehicle.getLanePosition(veh_id),
                         'speed': traci.vehicle.getSpeed(veh_id),
@@ -442,16 +444,13 @@ class SUMORLEnvironmentOptimized:
                         'lane_index': traci.vehicle.getLaneIndex(veh_id),
                         'lane_id': traci.vehicle.getLaneID(veh_id),
                         'road_id': traci.vehicle.getRoadID(veh_id),
-                        'is_icv': is_icv,
+                        'is_icv': self._is_icv_vehicle(veh_id),
                         'id': veh_id
                     }
                 except Exception as e:
+                    import logging
+                    logging.warning(f"获取车辆 {veh_id} 数据失败: {e}")
                     continue
-        
-        # 添加 ICV 标记
-        for veh_id in vehicle_data:
-            if 'is_icv' not in vehicle_data[veh_id]:
-                vehicle_data[veh_id]['is_icv'] = hash(veh_id) % 100 < 25
         
         # 计算全局指标
         global_metrics = self._compute_global_metrics(vehicle_data)

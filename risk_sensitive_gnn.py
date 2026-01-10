@@ -118,7 +118,7 @@ class GraphAttentionLayer(nn.Module):
     支持边特征和风险感知的注意力机制
     """
     
-    def __init__(self, in_channels: int, out_channels: int, heads: int = 4, 
+    def __init__(self, in_channels: int, out_channels: int, heads: int = 4,
                  edge_dim: int = 32, concat: bool = False):
         super().__init__()
         
@@ -126,6 +126,7 @@ class GraphAttentionLayer(nn.Module):
         self.out_channels = out_channels
         self.heads = heads
         self.concat = concat
+        self.edge_dim = edge_dim
         
         # 线性变换
         self.linear = nn.Linear(in_channels, heads * out_channels, bias=False)
@@ -138,7 +139,8 @@ class GraphAttentionLayer(nn.Module):
         
         # 输出变换
         if not concat:
-            self.output_transform = nn.Linear(heads * out_channels, out_channels)
+            # 当concat=False时，多头结果会平均，所以输入维度是out_channels
+            self.output_transform = nn.Linear(out_channels, out_channels)
         
         self.reset_parameters()
     
@@ -150,7 +152,7 @@ class GraphAttentionLayer(nn.Module):
         if hasattr(self, 'output_transform'):
             nn.init.xavier_uniform_(self.output_transform.weight)
     
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, 
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor,
                 edge_attr: Optional[torch.Tensor] = None,
                 attention_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -168,26 +170,45 @@ class GraphAttentionLayer(nn.Module):
         # 1. 线性变换节点特征
         x = self.linear(x).view(N, self.heads, self.out_channels)  # [N, heads, out_channels]
         
-        # 2. 边特征变换
-        if edge_attr is not None:
-            edge_attr = self.edge_transform(edge_attr).view(-1, self.heads, self.out_channels)
+        # 2. 边特征变换 - 保持原始边特征用于注意力计算
+        if edge_attr is not None and edge_index.size(1) > 0:
+            # 用于消息传递的边特征变换
+            edge_attr_for_message = self.edge_transform(edge_attr).view(-1, self.heads, self.out_channels)
+            # 用于注意力计算的原始边特征扩展
+            edge_attr_for_attention = edge_attr.unsqueeze(1).expand(-1, self.heads, -1)  # [E, heads, edge_dim]
         
         # 3. 计算注意力
+        if edge_index.size(1) == 0:  # 没有边的情况
+            # 直接返回变换后的节点特征
+            out = x
+            if self.concat:
+                out = out.view(N, self.heads * self.out_channels)
+            else:
+                out = out.mean(dim=1)  # [N, out_channels]
+                # 当concat=False时，直接使用out，不需要再展平
+                out = self.output_transform(out)  # [N, out_channels]
+            return out
+        
         row, col = edge_index  # [E], [E]
         
         # 获取源节点和目标节点特征
         x_i = x[row]  # [E, heads, out_channels]
         x_j = x[col]  # [E, heads, out_channels]
         
-        # 拼接特征用于注意力计算
+        # 拼接特征用于注意力计算 - 使用原始边特征
         if edge_attr is not None:
-            # 确保维度匹配 - edge_attr已经是[E, heads, out_channels]
-            attention_input = torch.cat([x_i, x_j, edge_attr], dim=-1)  # [E, heads, 3*out_channels]
+            # 拼接: x_i (out_channels) + x_j (out_channels) + edge_attr (edge_dim)
+            attention_input = torch.cat([x_i, x_j, edge_attr_for_attention], dim=-1)  # [E, heads, 2*out_channels + edge_dim]
         else:
             attention_input = torch.cat([x_i, x_j], dim=-1)  # [E, heads, 2*out_channels]
         
+        # 重塑为二维张量以匹配attention层的期望输入
+        E, heads, _ = attention_input.shape
+        attention_input = attention_input.view(E * heads, -1)  # [E*heads, 2*out_channels + edge_dim] 或 [E*heads, 2*out_channels]
+        
         # 计算注意力分数
-        alpha = self.attention(attention_input).squeeze(-1)  # [E, heads]
+        alpha = self.attention(attention_input).squeeze(-1)  # [E*heads]
+        alpha = alpha.view(E, heads)  # 重新reshape为 [E, heads]
         alpha = F.leaky_relu(alpha, negative_slope=0.2)
         
         # 应用风险权重（如果提供）
@@ -206,11 +227,16 @@ class GraphAttentionLayer(nn.Module):
             alpha_head = alpha[:, head].unsqueeze(-1)  # [E, 1]
             x_j_head = x_j[:, head, :]  # [E, out_channels]
             
-            # 加权邻居特征
-            weighted_features = alpha_head * x_j_head  # [E, out_channels]
+            # 如果有边特征，将边特征加到消息中
+            if edge_attr is not None:
+                edge_attr_head = edge_attr_for_message[:, head, :]  # [E, out_channels]
+                weighted_features = alpha_head * (x_j_head + edge_attr_head)  # [E, out_channels]
+            else:
+                weighted_features = alpha_head * x_j_head  # [E, out_channels]
             
-            # 聚合到目标节点
-            out[:, head, :] = torch.zeros(N, self.out_channels, device=x.device)
+            # 确保数据类型一致，然后聚合到目标节点
+            target_dtype = out.dtype
+            weighted_features = weighted_features.to(target_dtype)
             out[:, head, :].index_add_(0, col, weighted_features)
         
         # 5. 输出变换
@@ -218,6 +244,7 @@ class GraphAttentionLayer(nn.Module):
             out = out.view(N, self.heads * self.out_channels)
         else:
             out = out.mean(dim=1)  # [N, out_channels]
-            out = self.output_transform(out.view(N, self.heads * self.out_channels))
+            # 当concat=False时，直接使用out不需要再展平
+            out = self.output_transform(out)  # [N, out_channels]
         
         return out

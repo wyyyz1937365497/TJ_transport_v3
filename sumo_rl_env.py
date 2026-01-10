@@ -195,7 +195,10 @@ class SUMORLEnvironment:
                 print(f"⚠️  关闭SUMO时出错: {e}")
     
     def _get_observation(self) -> Dict[str, Any]:
-        """获取当前观测"""
+        """
+        获取当前观测
+        使用配置的ICV车辆列表而非随机哈希
+        """
         # 获取所有车辆ID
         self.vehicle_ids = traci.vehicle.getIDList()
         
@@ -210,8 +213,9 @@ class SUMORLEnvironment:
         vehicle_data = {}
         for veh_id in self.vehicle_ids:
             try:
-                # 确定是否为ICV (25%概率)
-                is_icv = hash(veh_id) % 100 < 25
+                # 使用配置的ICV列表或基于车辆类型的判断
+                # 在实际应用中，应该从配置文件或车辆类型中读取
+                is_icv = self._is_icv_vehicle(veh_id)
                 
                 vehicle_data[veh_id] = {
                     'position': traci.vehicle.getLanePosition(veh_id),
@@ -224,7 +228,53 @@ class SUMORLEnvironment:
                     'id': veh_id
                 }
             except Exception as e:
+                # 记录错误但继续处理其他车辆
+                import logging
+                logging.warning(f"获取车辆 {veh_id} 数据失败: {e}")
                 continue
+        
+        # 计算全局指标
+        global_metrics = self._compute_global_metrics(vehicle_data)
+        
+        observation = {
+            'vehicle_data': vehicle_data,
+            'global_metrics': global_metrics,
+            'vehicle_ids': list(vehicle_data.keys())
+        }
+        
+        return observation
+    
+    def _is_icv_vehicle(self, veh_id: str) -> bool:
+        """
+        判断车辆是否为ICV（智能网联车）
+        
+        Args:
+            veh_id: 车辆ID
+            
+        Returns:
+            is_icv: 是否为ICV
+        """
+        # 方法1: 从车辆类型判断（推荐）
+        try:
+            vehicle_class = traci.vehicle.getVehicleClass(veh_id)
+            if vehicle_class == "custom1" or vehicle_class == "emergency":
+                return True
+        except:
+            pass
+        
+        # 方法2: 从车辆类型ID判断
+        try:
+            vtype = traci.vehicle.getTypeID(veh_id)
+            if "icv" in vtype.lower() or "autonomous" in vtype.lower():
+                return True
+        except:
+            pass
+        
+        # 方法3: 使用确定性哈希（用于演示，生产环境应使用配置）
+        # 注意：这种方法在真实应用中不推荐，应该使用明确的配置
+        import hashlib
+        hash_value = int(hashlib.md5(veh_id.encode()).hexdigest(), 16)
+        return (hash_value % 100) < 25  # 25% ICV渗透率
         
         # 计算全局指标
         global_metrics = self._compute_global_metrics(vehicle_data)

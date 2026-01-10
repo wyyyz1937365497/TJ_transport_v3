@@ -73,7 +73,7 @@ class ProgressiveWorldModel(nn.Module):
             if isinstance(m, (nn.Linear, nn.LSTM)):
                 if hasattr(m, 'weight') and m.weight is not None:
                     nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if hasattr(m, 'bias') and m.bias is not None:
+                if hasattr(m, 'bias') and m.bias is not None and not isinstance(m.bias, bool):
                     nn.init.constant_(m.bias, 0)
     
     def set_phase(self, phase: int):

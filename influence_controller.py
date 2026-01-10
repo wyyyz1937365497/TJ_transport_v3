@@ -7,6 +7,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from typing import Dict, List, Tuple, Any, Optional
 
 
@@ -25,10 +26,6 @@ class InfluenceDrivenController(nn.Module):
         self.top_k = top_k
         self.action_dim = action_dim
         
-        # 影响力权重参数
-        self.alpha = nn.Parameter(torch.tensor(1.0))  # GNN重要性权重
-        self.beta = nn.Parameter(torch.tensor(5.0))    # 预测影响力权重
-        
         # 1. 全局上下文编码器
         self.global_encoder = nn.Sequential(
             nn.Linear(global_dim, 32),
@@ -37,18 +34,20 @@ class InfluenceDrivenController(nn.Module):
             nn.LayerNorm(64)
         )
         
-        # 2. 特征融合层
+        # 2. 特征融合层 - 修复维度问题
+        # 输入维度: gnn_dim (256) + 64 + world_dim (256) = 576
+        fusion_input_dim = gnn_dim + 64 + world_dim
         self.fusion_layer = nn.Sequential(
-            nn.Linear(gnn_dim + 64 + world_dim, 384),
+            nn.Linear(fusion_input_dim, 384),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(384, hidden_dim),
             nn.LayerNorm(hidden_dim)
         )
         
-        # 3. GNN重要性评分网络
-        self.gnn_importance_scorer = nn.Sequential(
-            nn.Linear(gnn_dim, 64),
+        # 3. 影响力评分网络
+        self.influence_scorer = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
@@ -56,17 +55,7 @@ class InfluenceDrivenController(nn.Module):
             nn.Sigmoid()
         )
         
-        # 4. 预测影响力评分网络
-        self.predicted_impact_scorer = nn.Sequential(
-            nn.Linear(world_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-        
-        # 5. 动作生成网络
+        # 4. 动作生成网络
         self.action_generator = nn.ModuleDict({
             'acceleration': nn.Sequential(
                 nn.Linear(hidden_dim, 64),
@@ -86,7 +75,7 @@ class InfluenceDrivenController(nn.Module):
             )
         })
         
-        # 6. 价值网络
+        # 5. 价值网络
         self.value_network = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(),
@@ -94,6 +83,10 @@ class InfluenceDrivenController(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 1)
         )
+        
+        # 可学习的权重参数
+        self.register_parameter('alpha', nn.Parameter(torch.tensor(1.0)))
+        self.register_parameter('beta', nn.Parameter(torch.tensor(5.0)))
         
         # 初始化权重
         self._init_weights()
@@ -103,7 +96,7 @@ class InfluenceDrivenController(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight)
-                if m.bias is not None:
+                if m.bias is not None and not isinstance(m.bias, bool):
                     nn.init.constant_(m.bias, 0.1)
     
     def forward(self, gnn_embedding: torch.Tensor, world_predictions: torch.Tensor,
@@ -127,17 +120,24 @@ class InfluenceDrivenController(nn.Module):
         
         # 2. 融合特征
         # 取世界模型的平均预测
-        avg_world_pred = world_predictions.mean(dim=1) if world_predictions.dim() == 3 else world_predictions
+        if world_predictions.dim() == 3:
+            avg_world_pred = world_predictions.mean(dim=1)  # [N, 257]
+        else:
+            avg_world_pred = world_predictions  # [N, 256]
         
         # 重复全局特征以匹配批次大小
         global_features_expanded = global_features.repeat(batch_size, 1)
         
-        # 融合
+        # 融合: gnn_embedding (256) + global_features (64) + avg_world_pred (256/257) = 576/577
+        # 我们需要确保维度匹配
+        if avg_world_pred.size(-1) == 257:
+            avg_world_pred = avg_world_pred[:, :256]  # 截断到256维
+        
         fused_input = torch.cat([
             gnn_embedding,
             global_features_expanded,
             avg_world_pred
-        ], dim=1)  # [N, 256+64+256] = [N, 576]
+        ], dim=1)  # [N, 576]
         
         fused_features = self.fusion_layer(fused_input)  # [N, 128]
         
@@ -155,18 +155,7 @@ class InfluenceDrivenController(nn.Module):
             }
         
         icv_features = fused_features[icv_mask]  # [N_icv, 128]
-        icv_gnn_emb = gnn_embedding[icv_mask]  # [N_icv, 256]
-        icv_world_pred = avg_world_pred[icv_mask]  # [N_icv, 256]
-        
-        # 计算GNN重要性得分
-        gnn_importance = self.gnn_importance_scorer(icv_gnn_emb).squeeze(-1)  # [N_icv]
-        
-        # 计算预测影响力得分
-        predicted_impact = self.predicted_impact_scorer(icv_world_pred).squeeze(-1)  # [N_icv]
-        
-        # 综合影响力得分：Score_i = α·Importance_GNN + β·Impact_Predicted
-        influence_scores = (self.alpha * gnn_importance + 
-                          self.beta * predicted_impact) / (self.alpha + self.beta)  # [N_icv]
+        influence_scores = self.influence_scorer(icv_features).squeeze(-1)  # [N_icv]
         
         # 4. 选择Top-K车辆
         k = min(self.top_k, len(icv_indices))
@@ -196,105 +185,136 @@ class InfluenceDrivenController(nn.Module):
             'raw_actions': raw_actions,
             'influence_scores': influence_scores,
             'value_estimates': value_estimates,
-            'top_k_scores': top_k_scores,
-            'gnn_importance': gnn_importance,
-            'predicted_impact': predicted_impact
+            'top_k_scores': top_k_scores
         }
-
-
-class IDMModel(nn.Module):
-    """
-    智能驾驶员模型 (Intelligent Driver Model)
-    用于非受控车辆的跟驰行为
-    """
     
-    def __init__(self, 
-                 desired_speed: float = 30.0,
-                 safe_time_headway: float = 1.5,
-                 max_accel: float = 2.0,
-                 comfortable_decel: float = 1.5,
-                 min_gap: float = 2.0,
-                 exponent: float = 4.0):
-        super().__init__()
-        
-        self.register_buffer('desired_speed', torch.tensor(desired_speed))
-        self.register_buffer('safe_time_headway', torch.tensor(safe_time_headway))
-        self.register_buffer('max_accel', torch.tensor(max_accel))
-        self.register_buffer('comfortable_decel', torch.tensor(comfortable_decel))
-        self.register_buffer('min_gap', torch.tensor(min_gap))
-        self.register_buffer('exponent', torch.tensor(exponent))
-    
-    def forward(self, speed: torch.Tensor, leader_speed: torch.Tensor, 
-                gap: torch.Tensor) -> torch.Tensor:
+    def compute_influence(self, gnn_importance: torch.Tensor, 
+                         predicted_impact: torch.Tensor) -> torch.Tensor:
         """
-        计算IDM加速度
+        计算综合影响力得分
         Args:
-            speed: [N] 当前车辆速度
-            leader_speed: [N] 前车速度
-            gap: [N] 车间距
+            gnn_importance: [N] GNN重要性得分
+            predicted_impact: [N] 预测影响力得分
         Returns:
-            acceleration: [N] 计算的加速度
+            influence_scores: [N] 综合影响力得分
         """
-        # 防止除零
-        gap = torch.clamp(gap, min=self.min_gap)
+        # 使用可学习的权重参数
+        alpha = torch.clamp(self.alpha, min=0.1, max=10.0)
+        beta = torch.clamp(self.beta, min=0.1, max=10.0)
         
-        # 自由流项
-        free_flow = 1.0 - (speed / self.desired_speed) ** self.exponent
+        influence_scores = alpha * gnn_importance + beta * predicted_impact
+        return influence_scores
+    
+    def compute_action_loss(self, actions: torch.Tensor, target_actions: torch.Tensor,
+                           advantages: torch.Tensor) -> torch.Tensor:
+        """
+        计算动作损失
+        Args:
+            actions: [B, 2] 采取的动作
+            target_actions: [B, 2] 目标动作
+            advantages: [B] 优势函数
+        Returns:
+            loss: 动作损失
+        """
+        # 加速动作损失（MSE）
+        accel_loss = F.mse_loss(actions[:, 0], target_actions[:, 0])
         
-        # 交互项
-        delta_v = speed - leader_speed
-        desired_gap = (self.min_gap + 
-                       speed * self.safe_time_headway +
-                       (speed * delta_v) / (2 * torch.sqrt(self.max_accel * self.comfortable_decel)))
+        # 换道动作损失（BCE）
+        lane_loss = F.binary_cross_entropy(actions[:, 1], target_actions[:, 1])
         
-        interaction = (desired_gap / gap) ** 2
+        # 优势加权
+        weighted_accel_loss = (accel_loss * advantages.abs()).mean()
+        weighted_lane_loss = (lane_loss * advantages.abs()).mean()
         
-        # IDM加速度
-        acceleration = self.max_accel * (free_flow - interaction)
+        # 总损失
+        total_loss = weighted_accel_loss + 0.5 * weighted_lane_loss
         
-        return acceleration
+        return total_loss
+    
+    def compute_value_loss(self, value_estimates: torch.Tensor, 
+                          returns: torch.Tensor) -> torch.Tensor:
+        """
+        计算价值损失
+        Args:
+            value_estimates: [N] 价值估计
+            returns: [N] 实际回报
+        Returns:
+            loss: 价值损失
+        """
+        return F.mse_loss(value_estimates, returns)
 
 
 class TopKSelector(nn.Module):
     """
     Top-K选择器
-    基于影响力得分选择最具影响力的K个智能体
+    根据影响力得分选择Top-K车辆
     """
     
-    def __init__(self, top_k: int = 5, temperature: float = 1.0):
+    def __init__(self, top_k: int = 5):
         super().__init__()
-        
         self.top_k = top_k
-        self.temperature = temperature
     
-    def forward(self, scores: torch.Tensor, is_icv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, influence_scores: torch.Tensor, 
+                icv_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        选择Top-K智能体
+        选择Top-K车辆
         Args:
-            scores: [N] 影响力得分
-            is_icv: [N] 是否为智能网联车
+            influence_scores: [N] 影响力得分
+            icv_mask: [N] ICV掩码
         Returns:
-            selected_indices: [K] 选中的索引
-            selected_scores: [K] 选中的得分
+            selected_indices: [K] 选中车辆索引
+            selected_scores: [K] 选中车辆得分
         """
-        # 只考虑ICV车辆
-        icv_mask = is_icv.bool()
-        icv_indices = torch.where(icv_mask)[0]
-        
-        if len(icv_indices) == 0:
-            return torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.float32)
-        
-        # 获取ICV车辆的得分
-        icv_scores = scores[icv_indices]
-        
-        # 应用温度缩放
-        scaled_scores = icv_scores / self.temperature
+        # 仅考虑ICV车辆
+        masked_scores = influence_scores * icv_mask.float()
         
         # 选择Top-K
-        k = min(self.top_k, len(icv_indices))
-        top_k_scores, top_k_local_indices = torch.topk(scaled_scores, k, largest=True)
+        k = min(self.top_k, icv_mask.sum().item())
+        if k == 0:
+            return torch.tensor([], dtype=torch.long), torch.tensor([])
         
-        # 转换为全局索引
-        selected_indices = icv_indices[top_k_local_indices]
+        top_k_scores, top_k_indices = torch.topk(masked_scores, k, largest=True)
         
-        return selected_indices, top_k_scores
+        return top_k_indices, top_k_scores
+
+
+class IDMController:
+    """
+    IDM (Intelligent Driver Model) 控制器
+    用于非受控车辆的跟驰行为
+    """
+    
+    def __init__(self, desired_speed: float = 30.0, 
+                 safe_time_headway: float = 1.5,
+                 min_gap: float = 2.0,
+                 max_accel: float = 2.0,
+                 comfortable_decel: float = 3.0):
+        self.desired_speed = desired_speed
+        self.safe_time_headway = safe_time_headway
+        self.min_gap = min_gap
+        self.max_accel = max_accel
+        self.comfortable_decel = comfortable_decel
+    
+    def compute_acceleration(self, ego_speed: float, leader_speed: float,
+                            gap: float) -> float:
+        """
+        计算IDM加速度
+        Args:
+            ego_speed: 自车速度
+            leader_speed: 前车速度
+            gap: 车距
+        Returns:
+            acceleration: 计算的加速度
+        """
+        delta_v = ego_speed - leader_speed
+        
+        # 期望车距
+        desired_gap = self.min_gap + ego_speed * self.safe_time_headway + \
+                     (ego_speed * delta_v) / (2 * np.sqrt(
+                         self.max_accel * self.comfortable_decel))
+        
+        # IDM加速度公式
+        accel = self.max_accel * (1 - (ego_speed / self.desired_speed)**4 - 
+                                  (desired_gap / max(gap, 0.1))**2)
+        
+        return float(accel)

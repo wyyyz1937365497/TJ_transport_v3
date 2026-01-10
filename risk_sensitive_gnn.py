@@ -181,7 +181,8 @@ class GraphAttentionLayer(nn.Module):
         
         # 拼接特征用于注意力计算
         if edge_attr is not None:
-            attention_input = torch.cat([x_i, x_j, edge_attr], dim=-1)  # [E, heads, 2*out_channels+edge_dim]
+            # 确保维度匹配 - edge_attr已经是[E, heads, out_channels]
+            attention_input = torch.cat([x_i, x_j, edge_attr], dim=-1)  # [E, heads, 3*out_channels]
         else:
             attention_input = torch.cat([x_i, x_j], dim=-1)  # [E, heads, 2*out_channels]
         

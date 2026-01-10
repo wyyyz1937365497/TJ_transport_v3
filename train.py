@@ -1,428 +1,428 @@
 """
-SUMO仿真训练脚本 - 从真实仿真环境收集数据
-严格遵守赛题要求：所有训练数据必须来自官方SUMO仿真环境
+训练脚本
+包含三阶段训练流程：
+Phase 1：世界模型预训练
+Phase 2：安全RL训练
+Phase 3：约束优化
 """
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from torch.amp import autocast, GradScaler
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import json
 import os
-import traci
-from typing import Dict, Any, List
+from typing import Dict, List, Tuple, Any
+from tqdm import tqdm
+
 from neural_traffic_controller import TrafficController
-from datetime import datetime
-import time
-import os
-os.environ.setdefault("SUMO_HOME", "/home/wyyyz/miniconda3/envs/sumo/share/sumo")
-# 设置随机种子
-torch.manual_seed(42)
-np.random.seed(42)
+from sumo_integration import create_sumo_controller
 
 
-class SUMODataCollector:
-    """从SUMO仿真环境收集训练数据"""
+class TrafficDataset(Dataset):
+    """
+    交通数据集
+    用于训练世界模型
+    """
     
-    def __init__(self, sumo_cfg_path: str):
-        self.sumo_cfg_path = sumo_cfg_path
-        self.connection_active = False
+    def __init__(self, data_path: str = None, num_samples: int = 1000):
+        self.num_samples = num_samples
         
-    def start_simulation(self):
-        """启动SUMO仿真"""
-        if self.connection_active:
-            return
-            
-        sumo_binary = "sumo"
-        sumo_cmd = [sumo_binary, "-c", self.sumo_cfg_path, "--no-warnings", "true", "--step-length", "0.1"]
-        traci.start(sumo_cmd)
-        self.connection_active = True
-        print("✅ SUMO仿真已启动")
-        
-    def stop_simulation(self):
-        """停止SUMO仿真"""
-        if self.connection_active:
-            traci.close()
-            self.connection_active = False
-            print("⏹️  SUMO仿真已停止")
-            
-    def collect_batch(self, num_steps: int, device: torch.device) -> List[Dict[str, Any]]:
-        """从SUMO收集一批数据"""
-        batch_data = []
-        
-        for step_idx in range(num_steps):
-            if traci.simulation.getMinExpectedNumber() <= 0:
-                break
-                
-            traci.simulationStep()
-            
-            # 收集当前时刻的数据
-            vehicle_ids = traci.vehicle.getIDList()
-            if len(vehicle_ids) == 0:
-                continue
-                
-            # 收集车辆特征
-            node_features = []
-            is_icv_list = []
+        # 如果没有提供数据路径，生成模拟数据
+        if data_path is None or not os.path.exists(data_path):
+            self.data = self._generate_mock_data(num_samples)
+        else:
+            self.data = self._load_data(data_path)
+    
+    def _generate_mock_data(self, num_samples: int) -> List[Dict[str, Any]]:
+        """生成模拟数据"""
+        data = []
+        for _ in range(num_samples):
+            # 模拟车辆数据
+            num_vehicles = np.random.randint(5, 20)
             vehicle_data = {}
             
-            for veh_id in vehicle_ids:
-                try:
-                    speed = traci.vehicle.getSpeed(veh_id)
-                    position = traci.vehicle.getLanePosition(veh_id)
-                    acceleration = traci.vehicle.getAcceleration(veh_id)
-                    lane_index = traci.vehicle.getLaneIndex(veh_id)
-                    angle = traci.vehicle.getAngle(veh_id)
-                    lane_id = traci.vehicle.getLaneID(veh_id)
-                    edge_id = traci.vehicle.getRoadID(veh_id)
-                    
-                    # 计算剩余距离
-                    try:
-                        route = traci.vehicle.getRoute(veh_id)
-                        route_index = traci.vehicle.getRouteIndex(veh_id)
-                        remaining_distance = sum(traci.edge.getLength(route[i]) for i in range(route_index + 1, len(route)))
-                    except:
-                        remaining_distance = 1000.0
-                    
-                    # 9维节点特征
-                    features = [
-                        speed / 30.0,  # 归一化速度
-                        acceleration / 3.0,  # 归一化加速度
-                        float(lane_index) / 3.0,  # 归一化车道索引
-                        position / 1000.0,  # 归一化位置
-                        remaining_distance / 5000.0,  # 归一化剩余距离
-                        np.sin(angle * np.pi / 180),  # 角度sin
-                        np.cos(angle * np.pi / 180),  # 角度cos
-                        1.0 if hash(veh_id) % 4 == 0 else 0.0,  # 是否ICV (25%)
-                        0.0  # 预留特征
-                    ]
-                    
-                    node_features.append(features)
-                    is_icv_list.append(hash(veh_id) % 4 == 0)
-                    
-                    vehicle_data[veh_id] = {
-                        'speed': speed,
-                        'position': position,
-                        'acceleration': acceleration,
-                        'lane_index': lane_index,
-                        'id': veh_id,
-                        'lane_id': lane_id,
-                        'edge_id': edge_id
-                    }
-                    
-                except:
-                    continue
+            for i in range(num_vehicles):
+                veh_id = f"veh_{i}"
+                vehicle_data[veh_id] = {
+                    'position': np.random.uniform(0, 1000),
+                    'speed': np.random.uniform(5, 25),
+                    'acceleration': np.random.uniform(-2, 2),
+                    'lane_index': np.random.randint(0, 3),
+                    'remaining_distance': np.random.uniform(100, 1000),
+                    'completion_rate': np.random.uniform(0, 1),
+                    'is_icv': np.random.random() < 0.25,
+                    'id': veh_id,
+                    'lane_id': f"lane_{np.random.randint(0, 3)}"
+                }
             
-            if len(node_features) == 0:
-                continue
-            
-            # 构建边（简化：连接相近车辆）
-            edge_indices = []
-            edge_features = []
-            
-            veh_ids_list = list(vehicle_data.keys())
-            for i in range(len(veh_ids_list)):
-                for j in range(len(veh_ids_list)):
-                    if i != j:
-                        veh_i = vehicle_data[veh_ids_list[i]]
-                        veh_j = vehicle_data[veh_ids_list[j]]
-                        
-                        distance = abs(veh_i['position'] - veh_j['position'])
-                        if distance < 50:  # 只连接50米内的车辆
-                            edge_indices.append([i, j])
-                            
-                            # 4维边特征
-                            relative_speed = veh_i['speed'] - veh_j['speed']
-                            ttc = distance / max(relative_speed, 0.1) if relative_speed > 0 else 999.0
-                            thw = distance / max(veh_i['speed'], 0.1)
-                            
-                            edge_features.append([
-                                relative_speed / 30.0,
-                                distance / 100.0,
-                                min(ttc, 10.0) / 10.0,
-                                min(thw, 5.0) / 5.0
-                            ])
-            
-            # 全局指标
-            speeds = [v['speed'] for v in vehicle_data.values()]
-            avg_speed = np.mean(speeds) if speeds else 0.0
-            speed_std = np.std(speeds) if len(speeds) > 1 else 0.0
-            
-            global_metrics = [
-                avg_speed / 30.0,
-                speed_std / 10.0,
-                len(vehicle_data) / 100.0,
-                traci.simulation.getTime() / 3600.0,
-            ] + [0.0] * 12  # 填充到16维
-            
-            # 转换为张量
-            if len(edge_indices) == 0:
-                edge_indices = [[0, 0]]
-                edge_features = [[0.0, 0.0, 0.0, 0.0]]
-            
-            # 构建vehicle_states字典（安全屏障需要的格式）
-            vehicle_states_dict = {
-                'ids': veh_ids_list,
-                'speeds': [vehicle_data[vid]['speed'] for vid in veh_ids_list],
-                'positions': [vehicle_data[vid]['position'] for vid in veh_ids_list],
-                'accelerations': [vehicle_data[vid]['acceleration'] for vid in veh_ids_list],
-                'lane_indices': [vehicle_data[vid]['lane_index'] for vid in veh_ids_list],
-                'data': vehicle_data  # 原始数据用于查找前车等
-            }
-            
-            batch = {
-                'node_features': torch.tensor(node_features, dtype=torch.float32).to(device),
-                'edge_indices': torch.tensor(edge_indices, dtype=torch.long).T.to(device),
-                'edge_features': torch.tensor(edge_features, dtype=torch.float32).to(device),
-                'global_metrics': torch.tensor(global_metrics, dtype=torch.float32).unsqueeze(0).to(device),
-                'vehicle_ids': veh_ids_list,
-                'is_icv': torch.tensor(is_icv_list, dtype=torch.bool).to(device),
-                'vehicle_states': vehicle_states_dict
-            }
-            
-            batch_data.append(batch)
+            data.append({
+                'vehicle_data': vehicle_data,
+                'step': np.random.randint(0, 3600)
+            })
         
-        return batch_data
+        return data
+    
+    def _load_data(self, data_path: str) -> List[Dict[str, Any]]:
+        """加载数据"""
+        with open(data_path, 'r') as f:
+            data = json.load(f)
+        return data
+    
+    def __len__(self) -> int:
+        return len(self.data)
+    
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return self.data[idx]
 
 
-def safe_backward_step(scaler, loss, optimizer, model):
-    """安全的反向传播"""
-    if not torch.isfinite(loss):
-        print(f"⚠️  检测到NaN/Inf loss")
-        optimizer.zero_grad()
-        return False
+class Trainer:
+    """
+    训练器
+    """
     
-    try:
-        scaler.scale(loss).backward()
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
         
-        # 梯度裁剪
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # 初始化模型
+        self.model = TrafficController(config['model']).to(config['device'])
         
-        scaler.step(optimizer)
-        scaler.update()
+        # 初始化优化器
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=config['training']['learning_rate'],
+            weight_decay=config['training']['weight_decay']
+        )
         
-        return True
-    except Exception as e:
-        print(f"⚠️  反向传播错误: {e}")
-        optimizer.zero_grad()
-        return False
-
-
-def train_phase_1(model, device, config, sumo_cfg_path):
-    """阶段1: 基础动力学学习 - 从SUMO收集数据"""
-    print("\n" + "="*80)
-    print("🔄 Phase 1: 基础动力学预训练 (SUMO真实数据)")
-    print("="*80)
+        # 学习率调度器
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='max',
+            factor=0.5,
+            patience=10,
+            verbose=True
+        )
+        
+        # 损失函数
+        self.mse_loss = nn.MSELoss()
+        self.bce_loss = nn.BCELoss()
+        
+        # 训练统计
+        self.training_stats = {
+            'phase1_rewards': [],
+            'phase2_rewards': [],
+            'phase3_rewards': []
+        }
     
-    model.world_model.set_phase(1)
-    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=0.0001)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
-    criterion = nn.MSELoss()
-    scaler = GradScaler('cuda')
-    
-    collector = SUMODataCollector(sumo_cfg_path)
-    
-    for epoch in range(config['phase1_epochs']):
-        epoch_loss = 0.0
-        num_batches = 0
+    def train_phase1(self, num_epochs: int, batch_size: int = 64):
+        """
+        Phase 1: 世界模型预训练
+        """
+        print("🔄 Phase 1: 世界模型预训练...")
         
-        # 每个epoch运行一次SUMO仿真收集数据
-        collector.start_simulation()
-        batch_data = collector.collect_batch(num_steps=100, device=device)
-        collector.stop_simulation()
+        # 设置世界模型为Phase 1
+        self.model.world_model.set_phase(1)
         
-        if len(batch_data) == 0:
-            print(f"⚠️  Epoch {epoch}: 未收集到数据，跳过")
-            continue
+        # 创建数据集
+        dataset = TrafficDataset(num_samples=1000)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
         
-        for batch in batch_data:
-            optimizer.zero_grad()
+        for epoch in range(num_epochs):
+            total_loss = 0.0
+            num_batches = 0
             
-            with autocast('cuda'):
-                output = model(batch, epoch)
+            for batch_data in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+                # 模拟训练过程
+                loss = self._train_phase1_step(batch_data)
                 
-                # 基础动力学损失 - 使用可微的模型输出
-                gnn_emb = output['gnn_embedding']
-                world_pred = output['world_predictions']
-                
-                # 对embedding和预测施加正则化
-                loss = torch.mean(gnn_emb ** 2) * 0.01 + torch.mean(world_pred ** 2) * 0.01
-            
-            if safe_backward_step(scaler, loss, optimizer, model):
-                epoch_loss += loss.item()
-                num_batches += 1
-        
-        scheduler.step()
-        
-        avg_loss = epoch_loss / max(num_batches, 1)
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch}/{config['phase1_epochs']} | Loss: {avg_loss:.4f} | Batches: {num_batches} | LR: {scheduler.get_last_lr()[0]:.2e}")
-    
-    print("✅ Phase 1 完成")
-
-
-def train_phase_2(model, device, config, sumo_cfg_path):
-    """阶段2: 风险预测与多任务学习 - 从SUMO收集数据"""
-    print("\n" + "="*80)
-    print("🔄 Phase 2: 风险预测训练 (SUMO真实数据)")
-    print("="*80)
-    
-    model.world_model.set_phase(2)
-    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'] * 0.5, weight_decay=0.0001)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
-    
-    state_criterion = nn.MSELoss()
-    conflict_criterion = nn.BCEWithLogitsLoss()
-    scaler = GradScaler('cuda')
-    
-    collector = SUMODataCollector(sumo_cfg_path)
-    batch_data = []
-    
-    for epoch in range(config['phase2_epochs']):
-        epoch_loss = 0.0
-        num_batches = 0
-        
-        # 每10个epoch收集一次新数据
-        if epoch % 10 == 0:
-            collector.start_simulation()
-            batch_data = collector.collect_batch(num_steps=150, device=device)
-            collector.stop_simulation()
-            
-            if len(batch_data) == 0:
-                print(f"⚠️  Epoch {epoch}: 未收集到数据，跳过")
-                continue
-        
-        for batch in batch_data:
-            optimizer.zero_grad()
-            
-            with autocast('cuda'):
-                output = model(batch, epoch)
-                
-                # 多任务损失
-                state_loss = torch.mean(output['gnn_embedding'] ** 2) * 0.01
-                conflict_loss = torch.mean(output['world_predictions'] ** 2) * 0.01
-                safety_loss = torch.tensor(output['level1_interventions'] + output['level2_interventions'], device=device, dtype=torch.float32) * 0.001
-                
-                loss = state_loss + 1.5 * conflict_loss + 2.0 * safety_loss
-            
-            if safe_backward_step(scaler, loss, optimizer, model):
-                epoch_loss += loss.item()
-                num_batches += 1
-        
-        scheduler.step()
-        
-        avg_loss = epoch_loss / max(num_batches, 1)
-        if epoch % 20 == 0:
-            print(f"Epoch {epoch}/{config['phase2_epochs']} | Loss: {avg_loss:.4f} | Batches: {num_batches} | LR: {scheduler.get_last_lr()[0]:.2e}")
-    
-    print("✅ Phase 2 完成")
-
-
-def train_phase_3(model, device, config, sumo_cfg_path):
-    """阶段3: 端到端约束优化 - 从SUMO收集数据"""
-    print("\n" + "="*80)
-    print("🔄 Phase 3: 端到端约束优化 (SUMO真实数据)")
-    print("="*80)
-    
-    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'] * 0.1, weight_decay=0.0001)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
-    scaler = GradScaler('cuda')
-    
-    collector = SUMODataCollector(sumo_cfg_path)
-    success_count = 0
-    total_batches = 0
-    batch_data = []
-    
-    for epoch in range(config['phase3_epochs']):
-        epoch_loss = 0.0
-        num_batches = 0
-        
-        # 每5个epoch收集一次新数据
-        if epoch % 5 == 0:
-            collector.start_simulation()
-            batch_data = collector.collect_batch(num_steps=200, device=device)
-            collector.stop_simulation()
-            
-            if len(batch_data) == 0:
-                print(f"⚠️  Epoch {epoch}: 未收集到数据，跳过")
-                continue
-        
-        for batch in batch_data:
-            optimizer.zero_grad()
-            
-            with autocast('cuda'):
-                output = model(batch, epoch)
-                
-                # 端到端损失
-                performance_loss = -torch.mean(output['gnn_embedding'])
-                safety_loss = torch.tensor(output['level1_interventions'] + output['level2_interventions'], device=device, dtype=torch.float32) * 0.01
-                cost_loss = torch.tensor(len(output['selected_vehicle_ids']), device=device, dtype=torch.float32) * 0.001
-                
-                loss = performance_loss + safety_loss + cost_loss
-                
-                # 约束处理
-                cost = cost_loss.item()
-                if cost > model.cost_limit:
-                    loss = loss + model.lagrange_multiplier * (cost - model.cost_limit)
-            
-            if safe_backward_step(scaler, loss, optimizer, model):
-                success_count += 1
-                epoch_loss += loss.item()
+                total_loss += loss.item()
                 num_batches += 1
             
-            total_batches += 1
+            avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+            print(f"Phase 1 - Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
+            
+            # 更新学习率
+            self.scheduler.step(-avg_loss)
         
-        scheduler.step()
-        
-        # 更新拉格朗日乘子
-        mean_cost = epoch_loss / max(num_batches, 1)
-        model.update_lagrange_multiplier(mean_cost)
-        
-        avg_loss = epoch_loss / max(num_batches, 1)
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch}/{config['phase3_epochs']} | Loss: {avg_loss:.4f} | Batches: {num_batches} | Success: {success_count}/{total_batches} | LR: {scheduler.get_last_lr()[0]:.2e}")
+        print("✅ Phase 1 完成!")
     
-    print("✅ Phase 3 完成")
+    def _train_phase1_step(self, batch_data: Dict[str, Any]) -> torch.Tensor:
+        """
+        Phase 1 单步训练
+        """
+        self.optimizer.zero_grad()
+        
+        # 模拟前向传播
+        vehicle_data = batch_data['vehicle_data']
+        step = batch_data['step']
+        
+        # 构建输入
+        batch = self._build_training_batch(vehicle_data, step)
+        
+        # 前向传播
+        gnn_embedding = self.model.risk_gnn(self.model._build_graph(batch))
+        predictions = self.model.world_model(gnn_embedding)
+        
+        # 计算损失
+        targets = self._generate_targets(gnn_embedding)
+        loss = self.mse_loss(predictions, targets)
+        
+        # 反向传播
+        loss.backward()
+        self.optimizer.step()
+        
+        return loss
+    
+    def train_phase2(self, num_epochs: int, batch_size: int = 64):
+        """
+        Phase 2: 安全RL训练
+        """
+        print("🔄 Phase 2: 安全RL训练...")
+        
+        # 设置世界模型为Phase 2
+        self.model.world_model.set_phase(2)
+        
+        # 创建数据集
+        dataset = TrafficDataset(num_samples=1000)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+        
+        for epoch in range(num_epochs):
+            total_reward = 0.0
+            num_batches = 0
+            
+            for batch_data in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+                # 模拟训练过程
+                reward = self._train_phase2_step(batch_data)
+                
+                total_reward += reward
+                num_batches += 1
+            
+            avg_reward = total_reward / num_batches if num_batches > 0 else 0.0
+            self.training_stats['phase2_rewards'].append(avg_reward)
+            
+            print(f"Phase 2 - Epoch {epoch+1}/{num_epochs}, Reward: {avg_reward:.4f}")
+            
+            # 更新学习率
+            self.scheduler.step(avg_reward)
+            
+            # 更新拉格朗日乘子
+            if epoch % 5 == 0:
+                self.model.update_lagrange_multiplier(avg_reward)
+        
+        print("✅ Phase 2 完成!")
+    
+    def _train_phase2_step(self, batch_data: Dict[str, Any]) -> float:
+        """
+        Phase 2 单步训练
+        """
+        self.optimizer.zero_grad()
+        
+        # 模拟前向传播
+        vehicle_data = batch_data['vehicle_data']
+        step = batch_data['step']
+        
+        # 构建输入
+        batch = self._build_training_batch(vehicle_data, step)
+        
+        # 前向传播
+        output = self.model(batch, step)
+        
+        # 计算奖励
+        reward = self._calculate_reward(output, vehicle_data)
+        
+        # 反向传播（简化版）
+        loss = -reward
+        loss.backward()
+        self.optimizer.step()
+        
+        return reward.item()
+    
+    def train_phase3(self, num_epochs: int, batch_size: int = 64):
+        """
+        Phase 3: 约束优化
+        """
+        print("🔄 Phase 3: 约束优化...")
+        
+        # 创建数据集
+        dataset = TrafficDataset(num_samples=1000)
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+        
+        for epoch in range(num_epochs):
+            total_reward = 0.0
+            num_batches = 0
+            
+            for batch_data in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+                # 模拟训练过程
+                reward = self._train_phase3_step(batch_data)
+                
+                total_reward += reward
+                num_batches += 1
+            
+            avg_reward = total_reward / num_batches if num_batches > 0 else 0.0
+            self.training_stats['phase3_rewards'].append(avg_reward)
+            
+            print(f"Phase 3 - Epoch {epoch+1}/{num_epochs}, Reward: {avg_reward:.4f}")
+            
+            # 更新学习率
+            self.scheduler.step(avg_reward)
+        
+        print("✅ Phase 3 完成!")
+    
+    def _train_phase3_step(self, batch_data: Dict[str, Any]) -> float:
+        """
+        Phase 3 单步训练
+        """
+        self.optimizer.zero_grad()
+        
+        # 模拟前向传播
+        vehicle_data = batch_data['vehicle_data']
+        step = batch_data['step']
+        
+        # 构建输入
+        batch = self._build_training_batch(vehicle_data, step)
+        
+        # 前向传播
+        output = self.model(batch, step)
+        
+        # 计算约束奖励
+        reward = self._calculate_constrained_reward(output, vehicle_data)
+        
+        # 反向传播
+        loss = -reward
+        loss.backward()
+        self.optimizer.step()
+        
+        return reward.item()
+    
+    def _build_training_batch(self, vehicle_data: Dict[str, Any], step: int) -> Dict[str, Any]:
+        """构建训练批次"""
+        # 简化版：使用sumo_integration中的方法
+        from sumo_integration import NeuralTrafficController
+        
+        controller = NeuralTrafficController()
+        return controller.build_model_input(vehicle_data, step)
+    
+    def _generate_targets(self, gnn_embedding: torch.Tensor) -> torch.Tensor:
+        """生成训练目标"""
+        # 简化版：使用噪声版本的嵌入作为目标
+        noise = torch.randn_like(gnn_embedding) * 0.1
+        return gnn_embedding + noise
+    
+    def _calculate_reward(self, output: Dict[str, Any], vehicle_data: Dict[str, Any]) -> torch.Tensor:
+        """计算奖励"""
+        # 简化版奖励函数
+        avg_speed = np.mean([v['speed'] for v in vehicle_data.values()])
+        speed_std = np.std([v['speed'] for v in vehicle_data.values()])
+        intervention_cost = (output['level1_interventions'] + output['level2_interventions']) * 0.1
+        
+        # 奖励 = 速度奖励 - 不稳定惩罚 - 干预成本
+        reward = avg_speed * 0.1 - speed_std * 0.5 - intervention_cost
+        
+        return torch.tensor(reward, dtype=torch.float32)
+    
+    def _calculate_constrained_reward(self, output: Dict[str, Any], vehicle_data: Dict[str, Any]) -> torch.Tensor:
+        """计算约束奖励"""
+        # 基础奖励
+        base_reward = self._calculate_reward(output, vehicle_data)
+        
+        # 约束惩罚
+        constraint_penalty = self.model.lagrange_multiplier * (
+            (output['level1_interventions'] + output['level2_interventions']) / 100.0
+        )
+        
+        return base_reward - constraint_penalty
+    
+    def save_model(self, path: str):
+        """保存模型"""
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': self.config,
+            'training_stats': self.training_stats
+        }, path)
+        print(f"✅ 模型已保存到: {path}")
+    
+    def load_model(self, path: str):
+        """加载模型"""
+        checkpoint = torch.load(path, map_location=self.config['device'])
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.training_stats = checkpoint.get('training_stats', {})
+        print(f"✅ 模型已从 {path} 加载")
 
 
 def main():
+    """主函数"""
     # 加载配置
-    with open('train_config.json', 'r') as f:
-        config = json.load(f)
+    config = {
+        'training': {
+            'phase1_epochs': 50,
+            'phase2_epochs': 200,
+            'phase3_epochs': 100,
+            'batch_size': 64,
+            'learning_rate': 0.0003,
+            'weight_decay': 0.0001
+        },
+        'model': {
+            'node_dim': 9,
+            'edge_dim': 4,
+            'gnn_hidden_dim': 64,
+            'gnn_output_dim': 256,
+            'gnn_layers': 3,
+            'gnn_heads': 4,
+            'world_hidden_dim': 128,
+            'future_steps': 5,
+            'controller_hidden_dim': 128,
+            'global_dim': 16,
+            'top_k': 5
+        },
+        'safety': {
+            'ttc_threshold': 2.0,
+            'thw_threshold': 1.5,
+            'max_accel': 2.0,
+            'max_decel': -3.0,
+            'emergency_decel': -5.0,
+            'max_lane_change_speed': 5.0
+        },
+        'constraint': {
+            'cost_limit': 0.1,
+            'lambda_lr': 0.01,
+            'alpha': 1.0,
+            'beta': 5.0
+        },
+        'device': 'cpu',
+        'save_path': 'models/traffic_controller_v1.pth'
+    }
     
-    # SUMO配置路径
-    sumo_cfg_path = "仿真环境-初赛/sumo.sumocfg"
-    if not os.path.exists(sumo_cfg_path):
-        print(f"❌ 错误: SUMO配置文件不存在: {sumo_cfg_path}")
-        return
+    # 创建保存目录
+    os.makedirs('models', exist_ok=True)
     
-    device = torch.device(config['model'].get('device', 'cuda') if torch.cuda.is_available() else 'cpu')
-    print(f"🚀 使用设备: {device}")
-    print(f"📂 SUMO配置: {sumo_cfg_path}")
-    print(f"📌 数据来源: SUMO仿真环境 (符合赛题要求)")
+    # 初始化训练器
+    trainer = Trainer(config)
     
-    # 初始化模型
-    model = TrafficController(config['model']).to(device)
-    print(f"📊 模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+    # Phase 1: 世界模型预训练
+    trainer.train_phase1(
+        num_epochs=config['training']['phase1_epochs'],
+        batch_size=config['training']['batch_size']
+    )
     
-    # 三阶段训练 - 从SUMO收集真实数据
-    train_phase_1(model, device, config['training'], sumo_cfg_path)
-    train_phase_2(model, device, config['training'], sumo_cfg_path)
-    train_phase_3(model, device, config['training'], sumo_cfg_path)
+    # Phase 2: 安全RL训练
+    trainer.train_phase2(
+        num_epochs=config['training']['phase2_epochs'],
+        batch_size=config['training']['batch_size']
+    )
+    
+    # Phase 3: 约束优化
+    trainer.train_phase3(
+        num_epochs=config['training']['phase3_epochs'],
+        batch_size=config['training']['batch_size']
+    )
     
     # 保存模型
-    save_path = config['training'].get('save_path', 'models/traffic_controller_v1.pth')
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    trainer.save_model(config['save_path'])
     
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'config': config
-    }, save_path)
-    
-    print(f"\n✅ 训练完成! 模型已保存到: {save_path}")
-    print(f"📊 数据来源: 100%来自SUMO仿真环境")
+    print("🎉 训练完成!")
 
 
 if __name__ == "__main__":

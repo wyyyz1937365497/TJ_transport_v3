@@ -1,179 +1,201 @@
 # 智能交通协同控制系统
 
-本项目实现了一个基于深度学习的智能交通协同控制系统，采用了先进的图神经网络（GNN）、世界模型和强化学习技术，旨在优化交通流量并提高道路安全性。
+基于深度强化学习的智能交通协同控制系统，用于优化城市快速路的交通效率。
 
-## 项目结构
+## 系统架构
+
+本系统采用分层架构设计，包含以下核心组件：
+
+### 1. 感知层：Risk-Sensitive GNN
+- **功能**：风险敏感图神经网络，捕捉车辆间的交互关系
+- **特点**：
+  - 在边特征中嵌入TTC（碰撞时间）和THW（车头时距）倒数
+  - 采用Biased Attention机制强化高风险交互的注意力权重
+  - 输出256维全局嵌入向量
+
+### 2. 预测层：Progressive World Model
+- **功能**：渐进式世界模型，预测未来交通状态
+- **训练阶段**：
+  - Phase 1：仅预测下一时刻车辆状态，学习基础动力学
+  - Phase 2：预测未来5步状态 + 冲突概率
+- **输出**：
+  - z_flow：流演化
+  - z_risk：风险演化
+
+### 3. 决策层：Influence-Driven Controller
+- **功能**：影响力驱动的Top-K稀疏控制机制
+- **核心算法**：
+  - 动态计算每辆车的影响力得分：`Score_i = α·Importance_GNN + β·Impact_Predicted`
+  - 仅对Top-K（如K=5）关键车辆执行强化学习控制
+  - 其余车辆使用IDM模型跟驰
+
+### 4. 安全层：Dual-mode Safety Shield
+- **Level 1**：动作裁剪（加速度限幅、速度非负）
+- **Level 2**：TTC < 2.0s时强制紧急制动
+- **特点**：在训练中施加巨大负奖励以避免进入高危状态
+
+## 文件结构
 
 ```
-TJ_transport_v3/
-├── neural_traffic_controller.py      # 主要的神经网络控制器实现
-├── main.py                          # 改进的主程序，集成神经控制器
-├── sumo_env_adapter.py              # SUMO环境适配器
-├── train.py                         # 传统训练脚本
-├── ray_train.py                     # Ray RLlib分布式训练脚本
-├── sumo_rl_train.py                 # SUMO-RL多实例训练脚本
-├── run_ray_training.py              # Ray训练启动脚本
-├── train_config.json                # 训练配置文件
-├── 仿真环境-初赛/                     # 原始仿真环境
-│   ├── main.py
-│   ├── net.xml
-│   ├── readme.md
-│   ├── routes.xml
-│   └── sumo.sumocfg
-├── 详细要求.md                       # 项目详细要求
-└── 赛题.md                          # 竞赛题目
+.
+├── neural_traffic_controller.py   # 主控制器
+├── risk_sensitive_gnn.py         # 风险敏感GNN
+├── progressive_world_model.py     # 渐进式世界模型
+├── influence_controller.py        # 影响力驱动控制器
+├── safety_shield.py             # 双模态安全屏障
+├── sumo_integration.py          # SUMO集成
+├── train.py                    # 训练脚本
+├── evaluate.py                 # 评估脚本
+├── config.json                 # 配置文件
+├── requirements.txt            # 依赖包
+└── README.md                   # 本文档
 ```
 
-## 核心特性
-
-### 1. 风险敏感图神经网络 (Risk-Sensitive GNN)
-- 采用图神经网络处理车辆之间的复杂交互关系
-- 在边特征中嵌入TTC（碰撞时间）和THW（车头时距）倒数
-- 采用Biased Attention机制强化高风险交互的注意力权重
-
-### 2. 渐进式世界模型 (Progressive World Model)
-- 分两个阶段训练：
-  - Phase 1：仅预测下一时刻车辆状态（位置、速度），学习基础动力学
-  - Phase 2：冻结特征提取器，解耦输出为流演化与风险演化，联合优化轨迹MSE与冲突分类损失
-
-### 3. 影响力驱动的Top-K稀疏控制机制
-- 动态计算每辆车的影响力得分
-- 仅对Top-K（如K=5）关键车辆执行强化学习控制
-- 其余车辆使用IDM模型跟驰，控制25%的智能车辆
-
-### 4. 双模态安全屏障
-- Level 1：动作裁剪（加速度限幅、速度非负）
-- Level 2：TTC < 2.0s时强制紧急制动，并在训练中施加巨大负奖励
-
-## 使用方法
-
-### 1. 运行仿真
+## 安装依赖
 
 ```bash
-python main.py
+pip install -r requirements.txt
 ```
 
-或者指定配置文件：
+## 快速开始
 
-```bash
-python main.py 仿真环境-初赛/sumo.sumocfg
-```
-
-### 2. 传统训练方式
+### 1. 训练模型
 
 ```bash
 python train.py
 ```
 
-### 3. Ray RLlib分布式并行训练
+训练过程分为三个阶段：
+- **Phase 1**：世界模型预训练（50 epochs）
+- **Phase 2**：安全RL训练（200 epochs）
+- **Phase 3**：约束优化（100 epochs）
 
-首先安装Ray RLlib：
-
-```bash
-pip install ray[rllib]
-```
-
-然后运行并行训练：
+### 2. 评估模型
 
 ```bash
-python run_ray_training.py
+python evaluate.py
 ```
 
-或者指定配置文件：
+评估结果将保存在 `results/evaluation_results.json` 中。
 
-```bash
-python run_ray_training.py --config train_config.json --sumo-config 仿真环境-初赛/sumo.sumocfg
+### 3. 使用预训练模型
+
+```python
+from sumo_integration import create_sumo_controller
+
+# 创建控制器
+controller = create_sumo_controller(config_path='config.json')
+
+# 应用控制
+control_results = controller.apply_control(vehicle_data, step)
 ```
 
-### 4. SUMO-RL多实例训练（推荐）
+## 配置说明
 
-使用SUMO-RL实现多SUMO实例并行训练：
+### 模型参数
 
-```bash
-python sumo_rl_train.py
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `node_dim` | 节点特征维度 | 9 |
+| `edge_dim` | 边特征维度 | 4 |
+| `gnn_hidden_dim` | GNN隐藏层维度 | 64 |
+| `gnn_output_dim` | GNN输出维度 | 256 |
+| `gnn_layers` | GNN层数 | 3 |
+| `gnn_heads` | GNN注意力头数 | 4 |
+| `future_steps` | 预测步数 | 5 |
+| `top_k` | 控制车辆数 | 5 |
+
+### 安全参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `ttc_threshold` | TTC阈值（秒） | 2.0 |
+| `thw_threshold` | THW阈值（秒） | 1.5 |
+| `max_accel` | 最大加速度 | 2.0 |
+| `max_decel` | 最大减速度 | -3.0 |
+| `emergency_decel` | 紧急减速度 | -5.0 |
+
+### 约束参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `cost_limit` | 成本限制 | 0.1 |
+| `lambda_lr` | 拉格朗日乘子学习率 | 0.01 |
+| `alpha` | GNN重要性权重 | 1.0 |
+| `beta` | 预测影响力权重 | 5.0 |
+
+## 核心算法
+
+### 影响力计算
+
+每辆车的影响力得分由两部分组成：
+
+```
+Score_i = α·Importance_GNN + β·Impact_Predicted
 ```
 
-### 5. 配置参数
+- `Importance_GNN`：基于GNN嵌入的重要性得分
+- `Impact_Predicted`：基于世界模型预测的影响力得分
+- `α` 和 `β`：可学习权重参数
 
-可以在[train_config.json](train_config.json)中修改训练参数：
+### 安全屏障
 
-- `phase1_epochs`: 第一阶段训练轮数
-- `phase2_epochs`: 第二阶段训练轮数
-- `phase3_epochs`: 第三阶段训练轮数
-- `batch_size`: 批次大小
-- `learning_rate`: 学习率
-- `top_k`: 同时控制的车辆数
-- `device`: 计算设备（cpu或cuda）
-- `parallel.num_workers`: 并行工作进程数
-- `parallel.base_port`: SUMO实例基础端口
-- `parallel.env_per_worker`: 每个工作进程的环境数
+双模态安全屏障确保所有控制指令的安全性：
 
-## 系统要求
+1. **Level 1（软约束）**：
+   - 动态调整加速度限制（基于速度）
+   - 仅在低速时允许换道
 
-- Python 3.7+
-- SUMO仿真器
-- PyTorch
-- PyTorch Geometric
-- Gymnasium
-- Pandas
-- NumPy
-- Ray RLlib (用于并行训练)
-
-## 技术细节
-
-### 感知层
-- 使用GATConv实现图注意力机制
-- 节点特征包括位置、速度、加速度等9维特征
-- 边特征包括相对距离、相对速度、TTC和THW
-
-### 预测层
-- LSTM网络预测未来状态
-- 解耦流演化和风险演化
-- 支持多步预测（默认5步）
-
-### 决策层
-- 融合GNN嵌入、世界模型预测和全局特征
-- 计算每辆车的影响力得分
-- 选择Top-K最具影响力的车辆进行控制
-
-### 安全层
-- 双层级安全机制确保驾驶安全
-- Level 1: 动作裁剪和限幅
-- Level 2: 紧急制动干预
-
-## 并行训练架构
-
-### Ray RLlib集成
-- 支持多进程并行训练
-- 每个进程可运行多个SUMO实例
-- 动态端口分配避免冲突
-- 高效的数据吞吐和模型更新
-
-### SUMO-RL多实例训练
-- 基于SUMO-RL框架实现多实例并行训练
-- 通过不同端口运行多个SUMO实例
-- 更高效地生成训练数据
-- 显著加快训练速度
-
-### 分布式训练优势
-- 提高训练数据吞吐量
-- 快速迭代实验
-- 支持更大规模的仿真场景
+2. **Level 2（硬约束）**：
+   - TTC < 2.0s 或 THW < 1.5s 时强制紧急制动
+   - 取消所有换道操作
 
 ## 评估指标
 
-系统优化目标为最大化总评分：
+系统根据以下指标进行评估：
+
+- **效率**：平均速度、吞吐量
+- **稳定性**：速度标准差
+- **安全性**：碰撞次数、紧急制动次数
+- **干预成本**：受控车辆数、干预次数
+
+最终得分：
+
 ```
 S_total = S_perf × P_int
 ```
+
 其中：
-- `S_perf` 是性能评分
-- `P_int` 是干预成本相关系数
+- `S_perf`：性能得分（效率 + 稳定性）
+- `P_int`：干预成本惩罚因子
 
-## 注意事项
+## 竞赛规则
 
-1. 本系统严格遵循竞赛规则，仅控制25%的智能车辆
-2. 不修改原始OD路径，仅对车辆速度进行控制
-3. 所有安全约束均得到满足
-4. 模型设计考虑了实时性要求
-5. 并行训练可显著加快模型收敛速度
+本系统严格遵守竞赛规则：
+
+1. **仅控制25%的智能车辆**：通过hash(veh_id) % 100 < 25确定ICV
+2. **不修改OD路径**：仅控制车辆驾驶行为
+3. **不使用外部数据**：所有训练数据在官方仿真环境中生成
+4. **按需干预**：仅对Top-K最具影响力的车辆进行控制
+
+## 性能优化
+
+- **GNN缓存**：缓存GNN推理结果，减少重复计算
+- **批量处理**：支持批量动作应用
+- **事件触发**：仅在特定步数执行控制（默认每5步）
+
+## 扩展性
+
+系统设计支持未来扩展：
+
+1. **复赛阶段**：可扩展至车路一体化协同控制
+2. **多场景**：支持不同交通场景的配置
+3. **分布式训练**：可与Ray RLlib集成
+
+## 许可证
+
+本项目用于智能交通协同控制竞赛。
+
+## 联系方式
+
+如有问题，请参考详细要求文档或联系竞赛组委会。

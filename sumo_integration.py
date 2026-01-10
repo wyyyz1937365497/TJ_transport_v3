@@ -85,7 +85,10 @@ class SUMOEnvironment:
             self.connected = False
     
     def _collect_observation(self) -> Dict[str, Any]:
-        """收集观测数据"""
+        """
+        收集观测数据
+        使用配置的ICV车辆列表而非随机哈希
+        """
         vehicle_ids = traci.vehicle.getIDList()
         
         vehicle_data = {}
@@ -98,9 +101,11 @@ class SUMOEnvironment:
                     'lane_index': traci.vehicle.getLaneIndex(veh_id),
                     'lane_id': traci.vehicle.getLaneID(veh_id),
                     'road_id': traci.vehicle.getRoadID(veh_id),
-                    'is_icv': hash(veh_id) % 100 < 25  # 25% ICV
+                    'is_icv': self._is_icv_vehicle(veh_id)
                 }
             except Exception as e:
+                import logging
+                logging.warning(f"获取车辆 {veh_id} 数据失败: {e}")
                 continue
         
         # 全局指标
@@ -114,53 +119,127 @@ class SUMOEnvironment:
         
         return observation
     
+    def _is_icv_vehicle(self, veh_id: str) -> bool:
+        """
+        判断车辆是否为ICV（智能网联车）
+        
+        Args:
+            veh_id: 车辆ID
+            
+        Returns:
+            is_icv: 是否为ICV
+        """
+        # 方法1: 从车辆类型判断（推荐）
+        try:
+            vehicle_class = traci.vehicle.getVehicleClass(veh_id)
+            if vehicle_class == "custom1" or vehicle_class == "emergency":
+                return True
+        except:
+            pass
+        
+        # 方法2: 从车辆类型ID判断
+        try:
+            vtype = traci.vehicle.getTypeID(veh_id)
+            if "icv" in vtype.lower() or "autonomous" in vtype.lower():
+                return True
+        except:
+            pass
+        
+        # 方法3: 使用确定性哈希（用于演示，生产环境应使用配置）
+        import hashlib
+        hash_value = int(hashlib.md5(veh_id.encode()).hexdigest(), 16)
+        return (hash_value % 100) < 25  # 25% ICV渗透率
+    
     def _compute_global_metrics(self, vehicle_data: Dict[str, Any]) -> List[float]:
-        """计算全局交通指标"""
+        """
+        计算全局交通指标
+        基于真实车辆状态计算16维指标
+        """
         if not vehicle_data:
             return [0.0] * 16
         
         speeds = [v['speed'] for v in vehicle_data.values()]
         positions = [v['position'] for v in vehicle_data.values()]
+        accelerations = [v.get('acceleration', 0.0) for v in vehicle_data.values()]
         
         avg_speed = np.mean(speeds)
         speed_std = np.std(speeds)
+        avg_accel = np.mean(accelerations)
         vehicle_count = len(vehicle_data)
-        icv_count = sum(1 for v in vehicle_data.values() if v['is_icv'])
+        
+        # ICV统计
+        icv_vehicles = [v for v in vehicle_data.values() if v.get('is_icv', False)]
+        hv_vehicles = [v for v in vehicle_data.values() if not v.get('is_icv', False)]
+        
+        icv_count = len(icv_vehicles)
+        hv_count = len(hv_vehicles)
+        
+        icv_total_speed = sum([v['speed'] for v in icv_vehicles])
+        hv_total_speed = sum([v['speed'] for v in hv_vehicles])
         
         metrics = [
             avg_speed,
             speed_std,
-            0.0,  # 平均加速度
+            avg_accel,
             float(vehicle_count),
             self.step_count * 0.1,  # 时间
             min(positions) if positions else 0.0,
             max(positions) if positions else 0.0,
             np.mean(positions) if positions else 0.0,
             float(icv_count),
-            float(vehicle_count - icv_count),
-            0.0,  # ICV总速度
-            0.0,  # 非ICV总速度
+            float(hv_count),
+            icv_total_speed,
+            hv_total_speed,
             avg_speed * vehicle_count,  # 总流量
             speed_std * vehicle_count,  # 总波动
-            0.0,  # 总加速度
+            avg_accel * vehicle_count,  # 总加速度
             self.step_count % 100  # 周期性特征
         ]
         
         return metrics
     
     def _compute_reward(self, observation: Dict[str, Any]) -> float:
-        """计算奖励"""
+        """
+        计算奖励 - 基于真实交通指标
+        考虑：流量效率、安全、稳定性
+        """
         vehicle_data = observation['vehicle_data']
         
         if not vehicle_data:
             return 0.0
         
         speeds = [v['speed'] for v in vehicle_data.values()]
-        avg_speed = np.mean(speeds)
-        speed_std = np.std(speeds)
+        accelerations = [v.get('acceleration', 0.0) for v in vehicle_data.values()]
         
-        # 简化奖励函数
-        reward = avg_speed * 0.1 - speed_std * 0.5
+        # 1. 流量效率奖励
+        avg_speed = np.mean(speeds) if speeds else 0.0
+        flow_efficiency = avg_speed / 30.0  # 归一化到[0,1]
+        
+        # 2. 稳定性惩罚
+        speed_std = np.std(speeds) if len(speeds) > 1 else 0.0
+        accel_std = np.std(accelerations) if len(accelerations) > 1 else 0.0
+        stability_penalty = (speed_std / 10.0 + accel_std / 5.0) * 0.5
+        
+        # 3. 安全评估
+        safety_penalty = 0.0
+        for vehicle in vehicle_data.values():
+            speed = vehicle.get('speed', 0.0)
+            accel = vehicle.get('acceleration', 0.0)
+            
+            # 检查危险驾驶行为
+            if speed > 35.0:  # 超速
+                safety_penalty += (speed - 35.0) * 0.1
+            if accel < -4.0:  # 急刹车
+                safety_penalty += (-accel - 4.0) * 0.2
+            if accel > 3.0:  # 急加速
+                safety_penalty += (accel - 3.0) * 0.1
+        
+        # 4. 综合奖励
+        reward = (
+            flow_efficiency * 10.0           # 流量效率权重
+            - stability_penalty * 2.0         # 稳定性惩罚权重
+            - safety_penalty * 5.0            # 安全惩罚权重
+        )
         
         return reward
 

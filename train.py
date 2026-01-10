@@ -152,8 +152,29 @@ class Trainer:
         # 设置世界模型为Phase 1
         self.model.world_model.set_phase(1)
         
-        # 创建数据集
-        dataset = TrafficDataset(num_samples=1000)
+        # 创建数据集 - 从配置或默认路径加载真实数据
+        data_path = self.config.get('data_path', None)
+        if data_path is None:
+            # 如果未提供数据路径，尝试使用默认路径
+            default_paths = [
+                'data/traffic_data.json',
+                'traffic_data.json',
+                'results/traffic_data.json'
+            ]
+            for path in default_paths:
+                if os.path.exists(path):
+                    data_path = path
+                    print(f"✅ 找到数据文件: {data_path}")
+                    break
+            
+            if data_path is None:
+                raise FileNotFoundError(
+                    "未找到训练数据文件。请先运行数据收集脚本生成SUMO仿真数据，"
+                    "或在配置中提供正确的data_path。"
+                    f"\n尝试的路径: {default_paths}"
+                )
+        
+        dataset = TrafficDataset(data_path=data_path, num_samples=1000, validate_data=True)
         num_workers = self.config['training'].get('num_workers', 2)
         dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=num_workers)
         
@@ -240,8 +261,29 @@ class Trainer:
         # 设置世界模型为Phase 2
         self.model.world_model.set_phase(2)
         
-        # 创建数据集
-        dataset = TrafficDataset(num_samples=1000)
+        # 创建数据集 - 从配置或默认路径加载真实数据
+        data_path = self.config.get('data_path', None)
+        if data_path is None:
+            # 如果未提供数据路径，尝试使用默认路径
+            default_paths = [
+                'data/traffic_data.json',
+                'traffic_data.json',
+                'results/traffic_data.json'
+            ]
+            for path in default_paths:
+                if os.path.exists(path):
+                    data_path = path
+                    print(f"✅ 找到数据文件: {data_path}")
+                    break
+            
+            if data_path is None:
+                raise FileNotFoundError(
+                    "未找到训练数据文件。请先运行数据收集脚本生成SUMO仿真数据，"
+                    "或在配置中提供正确的data_path。"
+                    f"\n尝试的路径: {default_paths}"
+                )
+        
+        dataset = TrafficDataset(data_path=data_path, num_samples=1000, validate_data=True)
         num_workers = self.config['training'].get('num_workers', 2)
         dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=num_workers)
         
@@ -334,8 +376,29 @@ class Trainer:
         """
         print("🔄 Phase 3: 约束优化...")
         
-        # 创建数据集
-        dataset = TrafficDataset(num_samples=1000)
+        # 创建数据集 - 从配置或默认路径加载真实数据
+        data_path = self.config.get('data_path', None)
+        if data_path is None:
+            # 如果未提供数据路径，尝试使用默认路径
+            default_paths = [
+                'data/traffic_data.json',
+                'traffic_data.json',
+                'results/traffic_data.json'
+            ]
+            for path in default_paths:
+                if os.path.exists(path):
+                    data_path = path
+                    print(f"✅ 找到数据文件: {data_path}")
+                    break
+            
+            if data_path is None:
+                raise FileNotFoundError(
+                    "未找到训练数据文件。请先运行数据收集脚本生成SUMO仿真数据，"
+                    "或在配置中提供正确的data_path。"
+                    f"\n尝试的路径: {default_paths}"
+                )
+        
+        dataset = TrafficDataset(data_path=data_path, num_samples=1000, validate_data=True)
         num_workers = self.config['training'].get('num_workers', 2)
         dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=num_workers)
         

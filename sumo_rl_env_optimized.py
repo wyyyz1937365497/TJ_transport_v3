@@ -548,9 +548,41 @@ class SUMORLEnvironmentOptimized:
             except Exception as e:
                 continue
     
+    def _is_icv_vehicle(self, veh_id: str) -> bool:
+        """
+        判断车辆是否为ICV（智能网联车）
+        
+        Args:
+            veh_id: 车辆ID
+            
+        Returns:
+            is_icv: 是否为ICV
+        """
+        # 方法1: 从车辆类型判断（推荐）
+        try:
+            vehicle_class = traci.vehicle.getVehicleClass(veh_id)
+            if vehicle_class == "custom1" or vehicle_class == "emergency":
+                return True
+        except:
+            pass
+        
+        # 方法2: 从车辆类型ID判断
+        try:
+            vtype = traci.vehicle.getTypeID(veh_id)
+            if "icv" in vtype.lower() or "autonomous" in vtype.lower():
+                return True
+        except:
+            pass
+        
+        # 方法3: 使用确定性哈希（用于演示，生产环境应使用配置）
+        import hashlib
+        hash_value = int(hashlib.md5(veh_id.encode()).hexdigest(), 16)
+        return (hash_value % 100) < 25  # 25% ICV渗透率
+    
     def _compute_reward(self, observation: Dict[str, Any]) -> float:
         """
-        计算奖励
+        计算奖励 - 基于真实交通指标
+        考虑：流量效率、安全、稳定性
         
         Args:
             observation: 观测数据
@@ -564,11 +596,37 @@ class SUMORLEnvironmentOptimized:
             return 0.0
         
         speeds = [v['speed'] for v in vehicle_data.values()]
-        avg_speed = np.mean(speeds)
-        speed_std = np.std(speeds)
+        accelerations = [v.get('acceleration', 0.0) for v in vehicle_data.values()]
         
-        # 奖励函数：速度奖励 - 不稳定惩罚
-        reward = avg_speed * 0.1 - speed_std * 0.5
+        # 1. 流量效率奖励
+        avg_speed = np.mean(speeds) if speeds else 0.0
+        flow_efficiency = avg_speed / 30.0  # 归一化到[0,1]
+        
+        # 2. 稳定性惩罚
+        speed_std = np.std(speeds) if len(speeds) > 1 else 0.0
+        accel_std = np.std(accelerations) if len(accelerations) > 1 else 0.0
+        stability_penalty = (speed_std / 10.0 + accel_std / 5.0) * 0.5
+        
+        # 3. 安全评估
+        safety_penalty = 0.0
+        for vehicle in vehicle_data.values():
+            speed = vehicle.get('speed', 0.0)
+            accel = vehicle.get('acceleration', 0.0)
+            
+            # 检查危险驾驶行为
+            if speed > 35.0:  # 超速
+                safety_penalty += (speed - 35.0) * 0.1
+            if accel < -4.0:  # 急刹车
+                safety_penalty += (-accel - 4.0) * 0.2
+            if accel > 3.0:  # 急加速
+                safety_penalty += (accel - 3.0) * 0.1
+        
+        # 4. 综合奖励
+        reward = (
+            flow_efficiency * 10.0           # 流量效率权重
+            - stability_penalty * 2.0         # 稳定性惩罚权重
+            - safety_penalty * 5.0            # 安全惩罚权重
+        )
         
         return reward
     

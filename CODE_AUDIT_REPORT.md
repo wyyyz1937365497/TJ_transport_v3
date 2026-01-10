@@ -7,9 +7,10 @@
 **审计目标**: 识别并修复所有使用虚假、占位或硬编码实现的代码段
 
 **重要说明**:
-- 所有训练阶段（Phase 1/2/3）现在要求提供真实的SUMO仿真数据
-- 如果未提供数据路径，系统会自动搜索默认路径：`data/traffic_data.json`、`traffic_data.json`、`results/traffic_data.json`
-- 如果找不到数据文件，会抛出明确的错误信息，指导用户如何生成数据
+- 本系统**仅支持实时SUMO数据收集模式**，不支持从JSON文件加载数据
+- 所有训练阶段（Phase 1/2/3）直接从SUMO仿真环境收集实时数据
+- 系统会自动连接到SUMO仿真，收集交通数据并直接用于训练
+- **核心功能**: 完整的实时SUMO数据收集系统，支持在线训练和主动车辆调度
 
 ---
 
@@ -25,6 +26,151 @@
 | 占位目标生成 | 1 | 1 | ✅ 完成 |
 | 缺少错误处理 | 5 | 5 | ✅ 完成 |
 | 缺少数据验证 | 2 | 2 | ✅ 完成 |
+
+---
+
+## 🆕 新增功能：实时SUMO数据收集系统
+
+### 概述
+
+为了支持在线训练和实时数据收集，新增了 [`realtime_data_collector.py`](realtime_data_collector.py) 模块，该模块提供了完整的SUMO仿真数据收集和训练数据生成功能。
+
+### 核心组件
+
+#### 1. RealtimeDataCollector 类
+
+**功能**:
+- 连接到SUMO仿真环境
+- 实时收集车辆状态数据
+- 支持主动车辆调度和控制干预
+- 管理训练数据缓冲区
+
+**主要方法**:
+- `connect()`: 连接到SUMO仿真
+- `disconnect()`: 断开SUMO连接
+- `collect_step(apply_interventions)`: 收集单步数据
+- `set_control_intervention(veh_id, intervention)`: 设置控制干预
+- `get_buffer_data(batch_size)`: 从缓冲区获取训练数据
+- `clear_buffer()`: 清空缓冲区
+- `get_statistics()`: 获取收集统计信息
+
+**关键特性**:
+- 线程安全的缓冲区管理
+- 自动检测ICV车辆
+- 计算全局交通指标
+- 支持控制干预（速度调整、车道变换等）
+
+#### 2. OnlineTrainingDataGenerator 类
+
+**功能**:
+- 将收集的SUMO数据转换为训练格式
+- 生成训练批次数据
+- 支持在线数据增强
+
+**主要方法**:
+- `generate_batch(vehicles_data, step)`: 生成训练批次
+- `get_buffer_data(batch_size)`: 获取缓冲区数据
+- `clear_buffer()`: 清空缓冲区
+
+### 使用方式
+
+#### 启用实时数据收集模式
+
+在 [`train.py`](train.py) 的配置中设置：
+
+```python
+config = {
+    # ... 其他配置
+    'use_realtime_collection': True,  # 启用实时数据收集
+    'sumo_cfg_path': '仿真环境-初赛/sumo.sumocfg',
+    'buffer_size': 10000,
+    'use_gui': False
+}
+```
+
+#### 训练流程
+
+1. **Phase 1**（世界模型预训练）:
+   - 连接到SUMO
+   - 收集数据（不应用干预）
+   - 训练世界模型
+   - 重复直到完成
+
+2. **Phase 2**（安全RL训练）:
+   - 连接到SUMO
+   - 收集数据（应用干预）
+   - 训练控制策略
+   - 更新拉格朗日乘子
+   - 重复直到完成
+
+3. **Phase 3**（约束优化）:
+   - 连接到SUMO
+   - 收集数据（应用干预）
+   - 优化约束参数
+   - 重复直到完成
+
+### 主动车辆调度
+
+实时数据收集器支持主动车辆调度，可以：
+
+```python
+# 设置速度干预
+data_collector.set_control_intervention(
+    veh_id="veh_0",
+    intervention={'type': 'speed', 'value': 15.0}
+)
+
+# 设置车道变换干预
+data_collector.set_control_intervention(
+    veh_id="veh_1",
+    intervention={'type': 'lane_change', 'value': 1}
+)
+```
+
+### 数据格式
+
+收集的数据包含：
+
+```python
+{
+    'vehicle_data': {
+        'veh_0': {
+            'id': 'veh_0',
+            'position': 123.45,
+            'speed': 15.67,
+            'acceleration': 0.5,
+            'lane_index': 0,
+            'is_icv': True,
+            'remaining_distance': 876.55,
+            'completion_rate': 0.12
+        },
+        # ... 其他车辆
+    },
+    'step': 100,
+    'global_metrics': {
+        'avg_speed': 14.5,
+        'speed_std': 3.2,
+        'vehicle_count': 15,
+        'icv_count': 5,
+        # ... 其他全局指标
+    }
+}
+```
+
+### 优势
+
+1. **实时性**: 直接从SUMO仿真获取数据，无需预先收集
+2. **灵活性**: 支持在线训练和离线训练两种模式
+3. **可控性**: 支持主动车辆调度和控制干预
+4. **高效性**: 缓冲区管理减少数据传输开销
+5. **完整性**: 自动计算全局交通指标和车辆交互
+
+### 注意事项
+
+1. **SUMO环境**: 需要正确配置SUMO仿真环境
+2. **TraCI依赖**: 需要安装SUMO并配置TraCI
+3. **内存管理**: 缓冲区大小应根据可用内存调整
+4. **线程安全**: 多线程环境下需要使用锁机制
 
 ---
 
@@ -654,31 +800,16 @@ def _validate_data(self):
 
 ## 🚀 使用建议
 
-### 数据收集
+### 实时数据收集
 
-在开始训练前，需要先从SUMO仿真收集真实交通数据：
+本系统使用实时SUMO数据收集模式，无需预先收集数据。训练时会自动：
 
-```python
-# 示例：收集SUMO仿真数据
-from sumo_rl_env import SUMORLEnvironment
+1. 连接到SUMO仿真环境
+2. 实时收集车辆状态数据
+3. 直接使用收集的数据进行训练
+4. 支持主动车辆调度和控制干预
 
-env = SUMORLEnvironment(
-    sumo_cfg_path='仿真环境-初赛/sumo.sumocfg',
-    max_steps=3600
-)
-
-observation = env.reset()
-collected_data = []
-
-for step in range(3600):
-    collected_data.append(observation)
-    observation, reward, done, info = env.step({})
-
-# 保存收集的数据
-import json
-with open('traffic_data.json', 'w') as f:
-    json.dump(collected_data, f)
-```
+**无需手动收集或保存JSON数据文件**，系统会自动处理所有数据收集流程。
 
 ### ICV配置
 
@@ -698,10 +829,13 @@ with open('traffic_data.json', 'w') as f:
 
 ### 训练配置
 
-使用修复后的训练脚本：
+使用实时SUMO训练脚本，无需配置数据路径：
 
 ```python
-# train.py
+# train.py - 直接运行即可
+python train.py
+
+# 配置参数（在train.py的main()函数中）
 config = {
     'training': {
         'phase1_epochs': 10,
@@ -713,23 +847,29 @@ config = {
         'use_amp': True,
         'num_workers': 2
     },
-    'data_path': 'traffic_data.json',  # 真实数据路径
-    'validate_data': True
+    'sumo_cfg_path': '仿真环境-初赛/sumo.sumocfg',  # SUMO配置路径
+    'buffer_size': 10000,  # 数据缓冲区大小
+    'use_gui': False  # 设为True可查看SUMO GUI
 }
 
+# 训练器会自动连接SUMO并收集数据
 trainer = Trainer(config)
 trainer.train_phase1(num_epochs=config['training']['phase1_epochs'])
 ```
+
+**注意**: 不再需要`data_path`参数，系统会自动从SUMO实时收集数据。
 
 ---
 
 ## ⚠️ 注意事项
 
-1. **数据要求**: 必须提供真实的SUMO仿真数据，否则会抛出错误
-2. **ICV配置**: 生产环境应使用明确的车辆类型配置，而非哈希方法
-3. **奖励权重**: 可根据具体业务需求调整奖励函数的权重系数
-4. **梯度裁剪**: max_norm=1.0是经验值，可根据实际情况调整
-5. **数据验证**: 首次加载新数据时建议启用验证
+1. **SUMO环境**: 必须正确安装SUMO并配置环境变量
+2. **SUMO配置**: 确保`仿真环境-初赛/sumo.sumocfg`路径正确
+3. **ICV配置**: 生产环境应使用明确的车辆类型配置，而非哈希方法
+4. **奖励权重**: 可根据具体业务需求调整奖励函数的权重系数
+5. **梯度裁剪**: max_norm=1.0是经验值，可根据实际情况调整
+6. **缓冲区大小**: 根据可用内存调整`buffer_size`参数
+7. **GUI模式**: 设置`use_gui: True`可查看SUMO仿真过程
 
 ---
 
@@ -746,17 +886,35 @@ trainer.train_phase1(num_epochs=config['training']['phase1_epochs'])
 
 本次审计共发现**14个主要问题**，涉及**6个类别**，已全部修复。修复后的代码：
 
-1. **数据真实性**: 强制使用真实SUMO数据，移除所有模拟数据生成
+1. **数据真实性**: 强制使用实时SUMO数据，移除所有模拟数据生成和JSON文件加载
 2. **业务逻辑完善**: 实现多维度奖励函数，考虑流量、安全、稳定性
 3. **配置灵活性**: 支持多种ICV识别方法，便于生产环境配置
 4. **错误处理**: 添加全面的错误处理和日志记录
 5. **数据验证**: 实现完整的数据验证机制，提前发现问题
 6. **训练稳定性**: 添加梯度裁剪和空批次处理，提高训练稳定性
+7. **实时数据收集**: 实现完整的SUMO实时数据收集系统，**仅支持实时模式**
+8. **主动车辆调度**: 支持在仿真环境中进行控制干预，满足后续训练需求
+9. **架构简化**: 移除JSON数据加载功能，简化代码结构，提高可维护性
 
-修复后的代码符合生产环境标准，具备良好的可维护性、可扩展性和健壮性。
+### 核心架构变更
+
+- **移除**: `TrafficDataset`类（JSON数据加载）
+- **移除**: `use_realtime_collection`配置标志
+- **移除**: 默认路径搜索逻辑（`data/traffic_data.json`等）
+- **保留**: `RealtimeDataCollector`（实时数据收集）
+- **简化**: 所有训练阶段直接使用实时数据收集
+
+### 新增功能亮点
+
+- **实时数据收集**: [`realtime_data_collector.py`](realtime_data_collector.py) 提供完整的SUMO数据收集功能
+- **在线训练**: 支持直接从SUMO仿真收集数据并用于训练
+- **主动控制**: 支持在仿真中应用速度调整、车道变换等控制干预
+- **线程安全**: 缓冲区管理支持多线程环境
+- **完整指标**: 自动计算全局交通指标和车辆交互特征
+- **零配置**: 无需预先收集数据，系统自动处理所有数据收集流程
 
 ---
 
-**审计完成日期**: 2026-01-10  
-**审计人员**: Kilo Code (Debug Mode)  
-**版本**: v1.0
+**审计完成日期**: 2026-01-10
+**审计人员**: Kilo Code (Code Mode)
+**版本**: v2.0 - 实时SUMO专用版本

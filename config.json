@@ -34,6 +34,9 @@
     "alpha": 1.0,
     "beta": 5.0
   },
-  "device": "cpu",
-  "save_path": "models/traffic_controller_v1.pth"
+  "device": "cuda",
+  "save_path": "models/traffic_controller_v1.pth",
+  "use_realtime_collection": true,
+  "sumo_cfg_path": "仿真环境-初赛/sumo.sumocfg",
+  "buffer_size": 100000
 }

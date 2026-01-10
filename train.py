@@ -4,106 +4,26 @@
 Phase 1：世界模型预训练
 Phase 2：安全RL训练
 Phase 3：约束优化
+
+注意：本系统仅支持实时SUMO数据收集模式，不支持从JSON文件加载数据。
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 import numpy as np
-import json
 import os
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 from tqdm import tqdm
 
 from neural_traffic_controller import TrafficController
-
-
-class TrafficDataset(Dataset):
-    """
-    交通数据集
-    用于训练世界模型
-    从真实SUMO仿真数据或预收集的数据集加载
-    """
-    
-    def __init__(self, data_path: str = None, num_samples: int = 1000,
-                 validate_data: bool = True):
-        self.num_samples = num_samples
-        self.validate_data = validate_data
-        
-        # 优先从真实数据路径加载
-        if data_path is not None and os.path.exists(data_path):
-            self.data = self._load_data(data_path)
-            if validate_data:
-                self._validate_data()
-        else:
-            # 如果没有真实数据，抛出错误而非生成模拟数据
-            if data_path is None:
-                raise ValueError(
-                    "必须提供数据路径。真实训练需要从SUMO仿真收集的交通数据。"
-                    "请先运行数据收集脚本或提供预收集的数据集。"
-                )
-            else:
-                raise FileNotFoundError(
-                    f"数据文件不存在: {data_path}。"
-                    "请确保已正确收集并保存交通数据。"
-                )
-    
-    def _validate_data(self):
-        """验证数据完整性"""
-        if not self.data:
-            raise ValueError("数据集为空")
-        
-        # 检查必要字段
-        required_fields = ['vehicle_data', 'step']
-        for i, sample in enumerate(self.data):
-            for field in required_fields:
-                if field not in sample:
-                    raise ValueError(f"样本 {i} 缺少必要字段: {field}")
-            
-            # 验证车辆数据
-            vehicle_data = sample['vehicle_data']
-            if not vehicle_data:
-                continue
-            
-            required_vehicle_fields = ['position', 'speed', 'acceleration',
-                                      'lane_index', 'is_icv', 'id']
-            for veh_id, vehicle in vehicle_data.items():
-                for field in required_vehicle_fields:
-                    if field not in vehicle:
-                        raise ValueError(
-                            f"样本 {i}, 车辆 {veh_id} 缺少必要字段: {field}"
-                        )
-                
-                # 验证数据范围
-                if not (0 <= vehicle['speed'] <= 50):  # 合理速度范围
-                    raise ValueError(
-                        f"样本 {i}, 车辆 {veh_id} 速度异常: {vehicle['speed']}"
-                    )
-                if not (-10 <= vehicle['acceleration'] <= 10):  # 合理加速度范围
-                    raise ValueError(
-                        f"样本 {i}, 车辆 {veh_id} 加速度异常: {vehicle['acceleration']}"
-                    )
-        
-        print(f"✅ 数据验证通过: {len(self.data)} 个样本")
-    
-    def _load_data(self, data_path: str) -> List[Dict[str, Any]]:
-        """加载数据"""
-        with open(data_path, 'r') as f:
-            data = json.load(f)
-        return data
-    
-    def __len__(self) -> int:
-        return len(self.data)
-    
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        return self.data[idx]
+from realtime_data_collector import RealtimeDataCollector, OnlineTrainingDataGenerator
 
 
 class Trainer:
     """
-    训练器 - 支持混合精度训练
+    训练器 - 仅支持实时SUMO数据收集模式
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -125,7 +45,7 @@ class Trainer:
             mode='max',
             factor=0.5,
             patience=10,
-            verbose=False  # 移除废弃的verbose参数或设置为False
+            verbose=False
         )
         
         # 混合精度训练
@@ -142,58 +62,73 @@ class Trainer:
             'phase2_rewards': [],
             'phase3_rewards': []
         }
+        
+        # 实时数据收集器（必需）
+        sumo_cfg = config.get('sumo_cfg_path', '仿真环境-初赛/sumo.sumocfg')
+        self.data_collector = RealtimeDataCollector(
+            sumo_cfg_path=sumo_cfg,
+            max_buffer_size=config.get('buffer_size', 10000),
+            use_gui=config.get('use_gui', False)
+        )
+        print(f"✅ 已初始化实时数据收集器")
+        print(f"   SUMO配置: {sumo_cfg}")
+        print(f"   缓冲区大小: {config.get('buffer_size', 10000)}")
+        print(f"   使用GUI: {config.get('use_gui', False)}")
     
     def train_phase1(self, num_epochs: int, batch_size: int = 64):
         """
-        Phase 1: 世界模型预训练
+        Phase 1: 世界模型预训练 - 实时数据收集模式
         """
-        print("🔄 Phase 1: 世界模型预训练...")
+        print("🔄 Phase 1: 世界模型预训练（实时数据收集模式）...")
         
         # 设置世界模型为Phase 1
         self.model.world_model.set_phase(1)
         
-        # 创建数据集 - 从配置或默认路径加载真实数据
-        data_path = self.config.get('data_path', None)
-        if data_path is None:
-            # 如果未提供数据路径，尝试使用默认路径
-            default_paths = [
-                'data/traffic_data.json',
-                'traffic_data.json',
-                'results/traffic_data.json'
-            ]
-            for path in default_paths:
-                if os.path.exists(path):
-                    data_path = path
-                    print(f"✅ 找到数据文件: {data_path}")
-                    break
-            
-            if data_path is None:
-                raise FileNotFoundError(
-                    "未找到训练数据文件。请先运行数据收集脚本生成SUMO仿真数据，"
-                    "或在配置中提供正确的data_path。"
-                    f"\n尝试的路径: {default_paths}"
-                )
+        # 连接到SUMO
+        self.data_collector.connect()
         
-        dataset = TrafficDataset(data_path=data_path, num_samples=1000, validate_data=True)
-        num_workers = self.config['training'].get('num_workers', 2)
-        dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=num_workers)
-        
-        for epoch in range(num_epochs):
-            total_loss = 0.0
-            num_batches = 0
-            
-            for batch_data in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-                # 模拟训练过程
-                loss = self._train_phase1_step(batch_data)
+        try:
+            for epoch in range(num_epochs):
+                total_loss = 0.0
+                num_batches = 0
                 
-                total_loss += loss.item()
-                num_batches += 1
-            
-            avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-            print(f"Phase 1 - Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
-            
-            # 更新学习率
-            self.scheduler.step(-avg_loss)
+                # 收集数据直到有足够的样本
+                while not self.data_collector.is_ready_for_training():
+                    step_data = self.data_collector.collect_step(apply_interventions=False)
+                    if step_data is None:
+                        continue
+                    
+                    # 每100步输出进度
+                    if self.data_collector.current_step % 100 == 0:
+                        stats = self.data_collector.get_statistics()
+                        print(f"  [收集] 步数: {stats['current_step']}, "
+                              f"样本数: {stats['collected_samples']}")
+                
+                # 训练
+                while self.data_collector.is_ready_for_training():
+                    # 生成训练批次
+                    batch_list = self.data_collector.get_buffer_data(batch_size)
+                    
+                    if not batch_list:
+                        break
+                    
+                    for batch_data in batch_list:
+                        loss = self._train_phase1_step(batch_data)
+                        total_loss += loss.item()
+                        num_batches += 1
+                    
+                    # 清空已使用的数据
+                    self.data_collector.clear_buffer()
+                
+                avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+                print(f"Phase 1 - Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
+                
+                # 更新学习率
+                self.scheduler.step(-avg_loss)
+        
+        finally:
+            # 断开SUMO连接
+            self.data_collector.disconnect()
         
         print("✅ Phase 1 完成!")
     
@@ -254,61 +189,64 @@ class Trainer:
     
     def train_phase2(self, num_epochs: int, batch_size: int = 64):
         """
-        Phase 2: 安全RL训练
+        Phase 2: 安全RL训练 - 实时数据收集模式
         """
-        print("🔄 Phase 2: 安全RL训练...")
+        print("🔄 Phase 2: 安全RL训练（实时数据收集模式）...")
         
         # 设置世界模型为Phase 2
         self.model.world_model.set_phase(2)
         
-        # 创建数据集 - 从配置或默认路径加载真实数据
-        data_path = self.config.get('data_path', None)
-        if data_path is None:
-            # 如果未提供数据路径，尝试使用默认路径
-            default_paths = [
-                'data/traffic_data.json',
-                'traffic_data.json',
-                'results/traffic_data.json'
-            ]
-            for path in default_paths:
-                if os.path.exists(path):
-                    data_path = path
-                    print(f"✅ 找到数据文件: {data_path}")
-                    break
-            
-            if data_path is None:
-                raise FileNotFoundError(
-                    "未找到训练数据文件。请先运行数据收集脚本生成SUMO仿真数据，"
-                    "或在配置中提供正确的data_path。"
-                    f"\n尝试的路径: {default_paths}"
-                )
+        # 连接到SUMO
+        self.data_collector.connect()
         
-        dataset = TrafficDataset(data_path=data_path, num_samples=1000, validate_data=True)
-        num_workers = self.config['training'].get('num_workers', 2)
-        dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=num_workers)
-        
-        for epoch in range(num_epochs):
-            total_reward = 0.0
-            num_batches = 0
-            
-            for batch_data in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-                # 模拟训练过程
-                reward = self._train_phase2_step(batch_data)
+        try:
+            for epoch in range(num_epochs):
+                total_reward = 0.0
+                num_batches = 0
                 
-                total_reward += reward
-                num_batches += 1
-            
-            avg_reward = total_reward / num_batches if num_batches > 0 else 0.0
-            self.training_stats['phase2_rewards'].append(avg_reward)
-            
-            print(f"Phase 2 - Epoch {epoch+1}/{num_epochs}, Reward: {avg_reward:.4f}")
-            
-            # 更新学习率
-            self.scheduler.step(avg_reward)
-            
-            # 更新拉格朗日乘子
-            if epoch % 5 == 0:
-                self.model.update_lagrange_multiplier(avg_reward)
+                # 收集数据直到有足够的样本
+                while not self.data_collector.is_ready_for_training():
+                    step_data = self.data_collector.collect_step(apply_interventions=True)
+                    if step_data is None:
+                        continue
+                    
+                    # 每100步输出进度
+                    if self.data_collector.current_step % 100 == 0:
+                        stats = self.data_collector.get_statistics()
+                        print(f"  [收集] 步数: {stats['current_step']}, "
+                              f"样本数: {stats['collected_samples']}")
+                
+                # 训练
+                while self.data_collector.is_ready_for_training():
+                    # 生成训练批次
+                    batch_list = self.data_collector.get_buffer_data(batch_size)
+                    
+                    if not batch_list:
+                        break
+                    
+                    for batch_data in batch_list:
+                        reward = self._train_phase2_step(batch_data)
+                        total_reward += reward
+                        num_batches += 1
+                    
+                    # 清空已使用的数据
+                    self.data_collector.clear_buffer()
+                
+                avg_reward = total_reward / num_batches if num_batches > 0 else 0.0
+                self.training_stats['phase2_rewards'].append(avg_reward)
+                
+                print(f"Phase 2 - Epoch {epoch+1}/{num_epochs}, Reward: {avg_reward:.4f}")
+                
+                # 更新学习率
+                self.scheduler.step(avg_reward)
+                
+                # 更新拉格朗日乘子
+                if epoch % 5 == 0:
+                    self.model.update_lagrange_multiplier(avg_reward)
+        
+        finally:
+            # 断开SUMO连接
+            self.data_collector.disconnect()
         
         print("✅ Phase 2 完成!")
     
@@ -372,54 +310,60 @@ class Trainer:
     
     def train_phase3(self, num_epochs: int, batch_size: int = 64):
         """
-        Phase 3: 约束优化
+        Phase 3: 约束优化 - 实时数据收集模式
         """
-        print("🔄 Phase 3: 约束优化...")
+        print("🔄 Phase 3: 约束优化（实时数据收集模式）...")
         
-        # 创建数据集 - 从配置或默认路径加载真实数据
-        data_path = self.config.get('data_path', None)
-        if data_path is None:
-            # 如果未提供数据路径，尝试使用默认路径
-            default_paths = [
-                'data/traffic_data.json',
-                'traffic_data.json',
-                'results/traffic_data.json'
-            ]
-            for path in default_paths:
-                if os.path.exists(path):
-                    data_path = path
-                    print(f"✅ 找到数据文件: {data_path}")
-                    break
-            
-            if data_path is None:
-                raise FileNotFoundError(
-                    "未找到训练数据文件。请先运行数据收集脚本生成SUMO仿真数据，"
-                    "或在配置中提供正确的data_path。"
-                    f"\n尝试的路径: {default_paths}"
-                )
+        # 设置世界模型为Phase 3
+        self.model.world_model.set_phase(3)
         
-        dataset = TrafficDataset(data_path=data_path, num_samples=1000, validate_data=True)
-        num_workers = self.config['training'].get('num_workers', 2)
-        dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=num_workers)
+        # 连接到SUMO
+        self.data_collector.connect()
         
-        for epoch in range(num_epochs):
-            total_reward = 0.0
-            num_batches = 0
-            
-            for batch_data in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-                # 模拟训练过程
-                reward = self._train_phase3_step(batch_data)
+        try:
+            for epoch in range(num_epochs):
+                total_reward = 0.0
+                num_batches = 0
                 
-                total_reward += reward
-                num_batches += 1
-            
-            avg_reward = total_reward / num_batches if num_batches > 0 else 0.0
-            self.training_stats['phase3_rewards'].append(avg_reward)
-            
-            print(f"Phase 3 - Epoch {epoch+1}/{num_epochs}, Reward: {avg_reward:.4f}")
-            
-            # 更新学习率
-            self.scheduler.step(avg_reward)
+                # 收集数据直到有足够的样本
+                while not self.data_collector.is_ready_for_training():
+                    step_data = self.data_collector.collect_step(apply_interventions=True)
+                    if step_data is None:
+                        continue
+                    
+                    # 每100步输出进度
+                    if self.data_collector.current_step % 100 == 0:
+                        stats = self.data_collector.get_statistics()
+                        print(f"  [收集] 步数: {stats['current_step']}, "
+                              f"样本数: {stats['collected_samples']}")
+                
+                # 训练
+                while self.data_collector.is_ready_for_training():
+                    # 生成训练批次
+                    batch_list = self.data_collector.get_buffer_data(batch_size)
+                    
+                    if not batch_list:
+                        break
+                    
+                    for batch_data in batch_list:
+                        reward = self._train_phase3_step(batch_data)
+                        total_reward += reward
+                        num_batches += 1
+                    
+                    # 清空已使用的数据
+                    self.data_collector.clear_buffer()
+                
+                avg_reward = total_reward / num_batches if num_batches > 0 else 0.0
+                self.training_stats['phase3_rewards'].append(avg_reward)
+                
+                print(f"Phase 3 - Epoch {epoch+1}/{num_epochs}, Reward: {avg_reward:.4f}")
+                
+                # 更新学习率
+                self.scheduler.step(avg_reward)
+        
+        finally:
+            # 断开SUMO连接
+            self.data_collector.disconnect()
         
         print("✅ Phase 3 完成!")
     
@@ -687,7 +631,7 @@ class Trainer:
 
 
 def main():
-    """主函数 - 单卡训练配置"""
+    """主函数 - 实时SUMO训练配置"""
     # 检测CUDA可用性
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"🖥️  使用设备: {device}")
@@ -695,7 +639,7 @@ def main():
         print(f"   GPU型号: {torch.cuda.get_device_name(0)}")
         print(f"   GPU显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     
-    # 加载配置 - 优化的单卡训练参数
+    # 加载配置 - 实时SUMO训练参数
     config = {
         'training': {
             'phase1_epochs': 10,  # 快速测试：10个epoch
@@ -735,11 +679,23 @@ def main():
             'beta': 5.0
         },
         'device': device,
-        'save_path': 'models/traffic_controller_v1.pth'
+        'save_path': 'models/traffic_controller_v1.pth',
+        # SUMO实时数据收集配置（必需）
+        'sumo_cfg_path': '仿真环境-初赛/sumo.sumocfg',
+        'buffer_size': 10000,
+        'use_gui': False
     }
     
     # 创建保存目录
     os.makedirs('models', exist_ok=True)
+    
+    print("=" * 60)
+    print("🚀 启动实时SUMO训练")
+    print("=" * 60)
+    print(f"   SUMO配置: {config['sumo_cfg_path']}")
+    print(f"   缓冲区大小: {config['buffer_size']}")
+    print(f"   使用GUI: {config['use_gui']}")
+    print("=" * 60)
     
     # 初始化训练器
     trainer = Trainer(config)
